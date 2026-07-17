@@ -1,10 +1,24 @@
 # MAPMARK: Google Maps Annotator
 
-**Version 1.7.0**
+**Version 1.7.1**
 
 MAPMARK is a Tampermonkey userscript that adds private, editable project layers to the Google Maps website. Markup is stored as longitude and latitude rather than fixed screen pixels, allowing annotations to stay aligned as the map pans or zooms.
 
 MAPMARK combines map drawing, project packages, independently visible and lockable layers, a searchable review register, workflow metadata, GIS exchange, and evidence-report generation without requiring a Google Maps API key or an external MAPMARK service.
+
+
+## What is new in v1.7.1
+
+Version 1.7.1 is a contrast and readability cleanup pass for the rebuilt workflow interface. It keeps the v1.7 workspace structure, but improves legibility by strengthening dark-mode contrast, increasing separation between panel surfaces, brightening secondary text, clarifying list-item and filter states, and making selected and hovered controls easier to read.
+
+Highlights:
+
+- Brighter secondary text and metadata in dark mode
+- Stronger separation between panel background, cards, inputs, and list rows
+- Higher-contrast workflow tabs, badges, metric pills, and chips
+- Clearer hover and active states in Review and Annotate
+- Improved placeholder visibility and small-label readability
+- No storage migration required; the schema remains version 6
 
 ## What is new in v1.7
 

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MAPMARK — Google Maps Annotator
 // @namespace    https://mbparks.com/fieldinstruments
-// @version      1.7.0
-// @description  A workflow-centered Google Maps annotation workspace with precision markup, review registers, evidence capture, project packages, and resilient local storage.
+// @version      1.7.1
+// @description  A workflow-centered Google Maps annotation workspace with precision markup, review registers, evidence capture, project packages, resilient local storage, and improved contrast.
 // @author       Michael Parks / Green Shoe Garage
 // @match        https://www.google.com/maps/*
 // @match        https://maps.google.com/*
@@ -18,7 +18,7 @@
 
   const APP = Object.freeze({
     name: 'MAPMARK',
-    version: '1.7.0',
+    version: '1.7.1',
     storageKey: 'mapmark.state.v1',
     dbName: 'mapmark.indexeddb.v1',
     dbVersion: 1,
@@ -744,6 +744,114 @@
       .mm-workflow-tab .mm-tab-icon { font-size:13px; }
       .mm-tool-grid-primary { grid-template-columns:repeat(3, minmax(0,1fr)); }
     }
+
+    /* v1.7.1 contrast and readability pass */
+    :host {
+      --mm-panel-soft: color-mix(in srgb, var(--mm-panel) 88%, var(--mm-bg));
+    }
+    input::placeholder, textarea::placeholder { color: color-mix(in srgb, var(--mm-muted) 82%, transparent); opacity: 1; }
+    .mm-version, .mm-save, .mm-pane-heading p, .mm-pane-count, .mm-command-label, .mm-list-meta, .mm-check,
+    .mm-help, .mm-filter-summary, .mm-card-title, .mm-context-field label, .mm-section-title,
+    .mm-selection-bar small, .mm-system-intro, .mm-import-report, .mm-status, .mm-empty, .mm-chip, .mm-bulk-title,
+    .mm-style-line span, .mm-diag-item span, .mm-diag-row small {
+      color: color-mix(in srgb, var(--mm-text) 74%, var(--mm-panel));
+    }
+    .mm-field, .mm-select, .mm-textarea, .mm-btn, .mm-tool, .mm-mini-btn, .mm-command-btn, .mm-metric,
+    .mm-list-item, .mm-card, .mm-selection-bar, .mm-bulk, .mm-status, .mm-system-intro, .mm-import-report,
+    .mm-diag-item, .mm-disclosure, .mm-style-line {
+      background: var(--mm-panel-soft);
+    }
+    .mm-field, .mm-select, .mm-textarea { font-size: 11px; }
+    .mm-field option, .mm-select option { color: #111; }
+    .mm-context-field label, .mm-section-title, .mm-card-title, .mm-pane-count, .mm-command-label, .mm-filter-count, .mm-chip, .mm-metric, .mm-disclosure > summary,
+    .mm-list-meta, .mm-selection-bar small, .mm-bulk-title, .mm-workflow-tab, .mm-workflow-tab .mm-tab-badge {
+      font-size: 10px;
+    }
+    .mm-pane-heading p { font-size: 11px; }
+    .mm-workflow-tab .mm-tab-icon { font-size: 15px; }
+    .mm-workflow-tab { color: color-mix(in srgb, var(--mm-text) 68%, var(--mm-panel)); }
+    .mm-workflow-tab:hover { color: var(--mm-text); }
+    .mm-workflow-tab.active { background: color-mix(in srgb, var(--mm-accent) 10%, var(--mm-panel)); }
+    .mm-workflow-tab .mm-tab-badge {
+      background: var(--mm-panel);
+      color: var(--mm-text);
+    }
+    .mm-pane-count, .mm-filter-count { font-weight: 820; }
+    .mm-card-title strong, .mm-list-title, .mm-selection-bar strong { color: var(--mm-text); }
+    .mm-disclosure > summary { color: var(--mm-text); }
+    .mm-metric { color: color-mix(in srgb, var(--mm-text) 76%, var(--mm-panel)); }
+    .mm-metric strong { color: var(--mm-text); }
+    .mm-metric:hover, .mm-metric.active {
+      color: var(--mm-text);
+      background: color-mix(in srgb, var(--mm-accent) 14%, var(--mm-panel));
+    }
+    .mm-btn:hover, .mm-mini-btn:hover, .mm-mini-btn.active, .mm-command-btn:hover, .mm-tool:hover,
+    .mm-tool.active, .mm-list-item:hover, .mm-list-item.active {
+      background: color-mix(in srgb, var(--mm-accent) 12%, var(--mm-panel));
+    }
+    .mm-list-item.primary {
+      border-color: color-mix(in srgb, var(--mm-accent) 55%, var(--mm-line));
+      box-shadow: inset 3px 0 0 var(--mm-accent);
+    }
+    .mm-chip { background: color-mix(in srgb, var(--mm-panel) 80%, var(--mm-bg)); }
+    .mm-chip.status-open { background: rgba(21,101,192,.14); color: #0f62c9; }
+    .mm-chip.status-review { background: rgba(249,168,37,.18); color: #8a5a00; }
+    .mm-chip.status-resolved { background: rgba(46,125,50,.16); color: #2e7d32; }
+    .mm-chip.status-archived { background: color-mix(in srgb, var(--mm-panel) 70%, var(--mm-bg)); }
+    .mm-chip.priority-high, .mm-chip.priority-critical { background: rgba(179,38,30,.12); }
+    .mm-commandbar, .mm-header, .mm-workflow-tabs { background: var(--mm-panel); }
+    .mm-contextbar { background: color-mix(in srgb, var(--mm-panel) 68%, var(--mm-bg)); }
+    @media (prefers-color-scheme: dark) {
+      :host {
+        --mm-bg: rgba(16, 19, 22, .985);
+        --mm-panel: #20272d;
+        --mm-panel-soft: #242d34;
+        --mm-text: #f6f8f9;
+        --mm-muted: #d7e0e5;
+        --mm-line: #62717b;
+        --mm-accent: #ff9b90;
+        --mm-accent-soft: rgba(255, 155, 144, .16);
+      }
+      #mm-panel { background: var(--mm-bg); }
+      .mm-contextbar { background: #1a2127; }
+      .mm-card, .mm-selection-bar, .mm-bulk, .mm-status, .mm-system-intro, .mm-import-report,
+      .mm-list-item, .mm-field, .mm-select, .mm-textarea, .mm-btn, .mm-mini-btn, .mm-command-btn,
+      .mm-tool, .mm-metric, .mm-disclosure, .mm-style-line, .mm-diag-item {
+        background: #232c33;
+      }
+      .mm-workflow-tab, .mm-workflow-tab .mm-tab-badge, .mm-pane-count, .mm-card-title,
+      .mm-section-title, .mm-command-label, .mm-list-meta, .mm-selection-bar small,
+      .mm-context-field label, .mm-filter-summary, .mm-bulk-title, .mm-version, .mm-save,
+      .mm-pane-heading p, .mm-help, .mm-style-line span, .mm-chip, .mm-check {
+        color: #d8e1e6;
+      }
+      .mm-icon-btn, .mm-mini-btn, .mm-command-btn, .mm-btn, .mm-tool, .mm-metric, .mm-field, .mm-select, .mm-textarea {
+        border-color: #6b7982;
+      }
+      .mm-card, .mm-selection-bar, .mm-bulk, .mm-disclosure, .mm-system-intro, .mm-import-report, .mm-list-item,
+      .mm-status, .mm-style-line, .mm-diag-item {
+        border-color: #5d6b74;
+      }
+      .mm-section-title, .mm-card-title { letter-spacing: .07em; }
+      .mm-workflow-tab.active {
+        color: #ffd1cb;
+        background: rgba(255, 155, 144, .14);
+      }
+      .mm-metric:hover, .mm-metric.active, .mm-list-item:hover, .mm-list-item.active,
+      .mm-btn:hover, .mm-mini-btn:hover, .mm-mini-btn.active, .mm-command-btn:hover, .mm-tool:hover, .mm-tool.active {
+        color: #fff7f6;
+        background: rgba(255, 155, 144, .14);
+      }
+      .mm-chip { background: #1c2328; color: #e3ebef; }
+      .mm-chip.status-open { background: rgba(52, 127, 232, .2); color: #b7d6ff; border-color: rgba(52, 127, 232, .45); }
+      .mm-chip.status-review { background: rgba(255, 193, 7, .18); color: #ffe199; border-color: rgba(255, 193, 7, .35); }
+      .mm-chip.status-resolved { background: rgba(76, 175, 80, .18); color: #b7e3b8; border-color: rgba(76, 175, 80, .35); }
+      .mm-chip.priority-high, .mm-chip.priority-critical { background: rgba(244, 67, 54, .18); color: #ffcdc9; border-color: rgba(244, 67, 54, .35); }
+      .mm-list-item.primary { border-color: rgba(255, 155, 144, .8); }
+      .mm-status.warn { background: rgba(249,168,37,.18); color: #ffe199; }
+      input::placeholder, textarea::placeholder { color: rgba(215, 224, 229, .78); }
+    }
+
     .mm-hidden { display: none !important; }
     #mm-import { display: none; }
   `;
