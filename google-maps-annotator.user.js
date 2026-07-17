@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MAPMARK — Google Maps Annotator
 // @namespace    https://mbparks.com/fieldinstruments
-// @version      1.4.0
-// @description  Add persistent Google Maps annotations with precision editing, rich geographic markup, measurements, KML/GeoJSON exchange, evidence capture, and printable reports.
+// @version      1.7.0
+// @description  A workflow-centered Google Maps annotation workspace with precision markup, review registers, evidence capture, project packages, and resilient local storage.
 // @author       Michael Parks / Green Shoe Garage
 // @match        https://www.google.com/maps/*
 // @match        https://maps.google.com/*
@@ -18,8 +18,13 @@
 
   const APP = Object.freeze({
     name: 'MAPMARK',
-    version: '1.4.0',
+    version: '1.7.0',
     storageKey: 'mapmark.state.v1',
+    dbName: 'mapmark.indexeddb.v1',
+    dbVersion: 1,
+    workspaceId: 'primary',
+    maxSnapshots: 12,
+    snapshotIntervalMs: 10 * 60 * 1000,
     tileSize: 256,
   });
 
@@ -74,58 +79,136 @@
   });
   const EVIDENCE_SCOPES = Object.freeze({
     visible: 'Visible map scope',
-    active: 'Active map set',
+    active: 'Active layer',
     selected: 'Selected annotations',
     register: 'Current register results',
-    all: 'All annotations',
+    all: 'Active project archive',
   });
 
-  const DEFAULT_STATE = () => ({
-    schema: 4,
-    activeCollectionId: 'default',
-    showAllCollections: false,
-    collections: [
-      { id: 'default', name: 'Field Notes', createdAt: new Date().toISOString() },
-    ],
-    annotations: [],
-    preferences: {
-      color: COLORS[0],
-      strokeWidth: 3,
-      markerIcon: 'pin',
-      snap: true,
-      showArchivedOnMap: false,
-      evidence: {
-        title: '',
-        subtitle: '',
-        scope: 'visible',
-        includeTitleBlock: true,
-        includeLegend: true,
-        includeNorthArrow: true,
-        includeScaleBar: true,
-        includeTable: true,
-      },
-      register: {
-        query: '',
-        tag: '',
-        type: 'all',
-        status: 'all',
-        priority: 'all',
-        color: 'all',
-        collection: 'scope',
-        sort: 'updated-desc',
-      },
+  const IMPORT_STRATEGIES = Object.freeze({
+    merge: 'Merge into workspace',
+    duplicate: 'Import as a separate copy',
+  });
+  const PROJECT_TEMPLATES = Object.freeze({
+    blank: {
+      label: 'Blank project',
+      description: 'Start with one general annotation layer.',
+      layers: ['Field Notes'],
+    },
+    survey: {
+      label: 'Site survey',
+      description: 'Organize observations, photographs, measurements, and follow-up work.',
+      layers: ['Observations', 'Photo Points', 'Measurements', 'Follow-up'],
+    },
+    accessibility: {
+      label: 'Accessibility review',
+      description: 'Review routes, entrances, barriers, amenities, and corrective actions.',
+      layers: ['Accessible Routes', 'Entrances', 'Barriers', 'Amenities', 'Actions'],
+    },
+    infrastructure: {
+      label: 'Infrastructure inspection',
+      description: 'Document assets, defects, utilities, safety concerns, and repair priorities.',
+      layers: ['Assets', 'Defects', 'Utilities', 'Safety', 'Repairs'],
     },
   });
 
-  let state = loadState();
+  const DEFAULT_STATE = () => {
+    const now = new Date().toISOString();
+    return {
+      schema: 6,
+      activeProjectId: 'project-default',
+      activeCollectionId: 'default',
+      showAllCollections: false,
+      projects: [
+        {
+          id: 'project-default',
+          name: 'Field Project',
+          description: '',
+          reference: '',
+          status: 'active',
+          createdAt: now,
+          updatedAt: now,
+        },
+      ],
+      collections: [
+        {
+          id: 'default',
+          projectId: 'project-default',
+          name: 'Field Notes',
+          visible: true,
+          locked: false,
+          archived: false,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ],
+      annotations: [],
+      preferences: {
+        color: COLORS[0],
+        strokeWidth: 3,
+        markerIcon: 'pin',
+        snap: true,
+        showArchivedOnMap: false,
+        showArchivedProjects: false,
+        importStrategy: 'merge',
+        reliability: {
+          automaticSnapshots: true,
+          snapshotIntervalMinutes: 10,
+        },
+        evidence: {
+          title: '',
+          subtitle: '',
+          scope: 'visible',
+          includeTitleBlock: true,
+          includeLegend: true,
+          includeNorthArrow: true,
+          includeScaleBar: true,
+          includeTable: true,
+        },
+        register: {
+          query: '',
+          tag: '',
+          type: 'all',
+          status: 'all',
+          priority: 'all',
+          color: 'all',
+          collection: 'scope',
+          sort: 'updated-desc',
+        },
+      },
+    };
+  };
+
+  const bootstrap = loadBootstrapState();
+  let state = bootstrap.state;
+  const storageRuntime = {
+    db: null,
+    ready: false,
+    mode: 'Starting',
+    integrity: 'Unchecked',
+    lastSavedAt: null,
+    lastSnapshotAt: null,
+    lastError: bootstrap.error || null,
+    fallbackReason: null,
+    migration: null,
+    recoveredFrom: null,
+    payloadBytes: 0,
+    snapshotCount: 0,
+    quarantineCount: 0,
+    snapshots: [],
+    saveSequence: 0,
+    pendingSave: false,
+  };
+  let pendingFocusCandidate = null;
   let pendingFocusId = null;
   try {
-    const candidate = sessionStorage.getItem('mapmark.pendingFocus');
-    if (candidate && state.annotations.some(annotation => annotation.id === candidate)) pendingFocusId = candidate;
+    pendingFocusCandidate = sessionStorage.getItem('mapmark.pendingFocus');
+    if (pendingFocusCandidate && state.annotations.some(annotation => annotation.id === pendingFocusCandidate)) pendingFocusId = pendingFocusCandidate;
     sessionStorage.removeItem('mapmark.pendingFocus');
   } catch (_) { /* storage unavailable */ }
   let ui = {
     expanded: Boolean(pendingFocusId),
+    workspace: 'annotate',
     tool: 'select',
     selectedId: pendingFocusId,
     selectedIds: new Set(pendingFocusId ? [pendingFocusId] : []),
@@ -140,6 +223,10 @@
     snapGuide: null,
     draftPoint: null,
     newCollectionOpen: false,
+    newProjectOpen: false,
+    projectArchiveArmed: false,
+    layerArchiveArmed: false,
+    lastImportReport: null,
     clearArmed: false,
     saveTimer: null,
     renderQueued: false,
@@ -148,6 +235,12 @@
     captureBusy: false,
     captureMode: false,
     captureIds: null,
+    diagnosticsOpen: false,
+    storageBusy: false,
+    restoreSnapshotArmed: null,
+    rebuildStorageArmed: false,
+    mapEnvironment: { mode: 'unknown', supported: false, reason: 'Map context not inspected yet.', signals: [] },
+    mapDetection: { candidates: 0, source: 'none', score: 0 },
   };
 
   const host = document.createElement('div');
@@ -344,6 +437,8 @@
     .mm-save { display: inline-flex; align-items: center; gap: 5px; color: var(--mm-muted); font-size: 10px; }
     .mm-save-dot { width: 7px; height: 7px; border-radius: 50%; background: #2e7d32; box-shadow: 0 0 0 2px rgba(46,125,50,.15); }
     .mm-save.saving .mm-save-dot { background: #f9a825; box-shadow: 0 0 0 2px rgba(249,168,37,.15); }
+    .mm-save.failed { color: #b3261e; }
+    .mm-save.failed .mm-save-dot { background: #b3261e; box-shadow: 0 0 0 2px rgba(179,38,30,.16); }
     .mm-icon-btn {
       width: 30px;
       height: 30px;
@@ -478,6 +573,27 @@
     .mm-legend-swatch { width:11px; height:11px; border-radius:3px; flex:0 0 auto; border:1px solid rgba(0,0,0,.2); }
     .mm-coordinate-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
     .mm-coordinate { color: var(--mm-muted); font-size: 9px; line-height: 1.45; padding: 7px 8px; border: 1px dashed var(--mm-line); border-radius: 7px; }
+    .mm-project-card { display:grid; gap:7px; padding:9px; border:1px solid var(--mm-line); border-radius:9px; background:var(--mm-panel); }
+    .mm-project-meta { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+    .mm-layer-list { display:grid; gap:5px; margin-top:7px; }
+    .mm-layer-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:5px; align-items:center; padding:6px; border:1px solid var(--mm-line); border-radius:8px; background:var(--mm-panel); }
+    .mm-layer-row.active { border-color:var(--mm-accent); box-shadow:inset 3px 0 0 var(--mm-accent); }
+    .mm-layer-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0; border:0; background:transparent; color:var(--mm-text); text-align:left; cursor:pointer; font-size:10px; font-weight:760; }
+    .mm-mini-btn { width:26px; height:26px; display:inline-grid; place-items:center; border:1px solid var(--mm-line); border-radius:7px; background:transparent; color:var(--mm-text); cursor:pointer; font-size:12px; }
+    .mm-mini-btn:hover, .mm-mini-btn.active { border-color:var(--mm-accent); background:var(--mm-accent-soft); color:var(--mm-accent); }
+    .mm-import-report { padding:8px; border:1px solid var(--mm-line); border-radius:8px; background:var(--mm-panel); color:var(--mm-muted); font-size:10px; line-height:1.4; }
+    .mm-diagnostics { display:grid; gap:7px; padding:9px; border:1px solid var(--mm-line); border-radius:9px; background:var(--mm-panel); }
+    .mm-diag-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+    .mm-diag-item { min-width:0; padding:7px; border:1px solid var(--mm-line); border-radius:7px; background:var(--mm-bg); }
+    .mm-diag-item span { display:block; color:var(--mm-muted); font-size:8px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
+    .mm-diag-item strong { display:block; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; }
+    .mm-diag-log { display:grid; gap:5px; max-height:150px; overflow:auto; }
+    .mm-diag-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px; align-items:center; padding:6px 7px; border:1px solid var(--mm-line); border-radius:7px; }
+    .mm-diag-row small { display:block; color:var(--mm-muted); font-size:8px; margin-top:2px; }
+    .mm-warning-banner { padding:8px; border:1px solid #b3261e; border-radius:8px; background:rgba(179,38,30,.09); color:#8f1d17; font-size:10px; line-height:1.4; }
+    @media (prefers-color-scheme: dark) { .mm-warning-banner { color:#ffb4ab; } }
+    .mm-lock-banner { padding:8px; border:1px solid #f9a825; border-radius:8px; background:rgba(249,168,37,.11); color:#8a5a00; font-size:10px; line-height:1.4; }
+    @media (prefers-color-scheme: dark) { .mm-lock-banner { color:#ffd180; } }
     .mm-empty { padding: 11px; border: 1px dashed var(--mm-line); border-radius: 8px; color: var(--mm-muted); text-align: center; font-size: 11px; }
     .mm-inspector { display: grid; gap: 7px; }
     .mm-selection-summary { padding: 10px; border: 1px solid var(--mm-line); border-radius: 8px; background: var(--mm-panel); font-size: 11px; line-height: 1.45; }
@@ -524,6 +640,110 @@
       font-size: 9px;
       line-height: 1.35;
     }
+
+    /* v1.7 workflow shell */
+    #mm-panel {
+      top: 56px;
+      width: min(500px, calc(100vw - 24px));
+      height: min(780px, calc(100vh - 68px));
+      max-height: calc(100vh - 68px);
+    }
+    .mm-header { flex: 0 0 auto; padding: 10px 11px; }
+    .mm-header-actions { display:flex; align-items:center; gap:6px; }
+    .mm-contextbar {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 7px;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--mm-line);
+      background: var(--mm-bg);
+    }
+    .mm-context-field { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:5px; align-items:end; }
+    .mm-context-field label { min-width:0; display:grid; gap:3px; color:var(--mm-muted); font-size:8px; font-weight:850; letter-spacing:.08em; text-transform:uppercase; }
+    .mm-context-field .mm-select { min-width:0; padding:7px 8px; font-size:10px; font-weight:720; }
+    .mm-workflow-tabs {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 2px;
+      padding: 5px 7px 0;
+      border-bottom: 1px solid var(--mm-line);
+      background: var(--mm-panel);
+    }
+    .mm-workflow-tab {
+      position:relative;
+      display:grid;
+      place-items:center;
+      gap:2px;
+      min-width:0;
+      padding:7px 3px 8px;
+      border:0;
+      border-bottom:3px solid transparent;
+      background:transparent;
+      color:var(--mm-muted);
+      cursor:pointer;
+      font-size:9px;
+      font-weight:780;
+    }
+    .mm-workflow-tab .mm-tab-icon { font-size:14px; line-height:1; }
+    .mm-workflow-tab .mm-tab-badge { position:absolute; top:3px; right:5px; min-width:15px; height:15px; display:grid; place-items:center; padding:0 3px; border-radius:999px; background:var(--mm-bg); border:1px solid var(--mm-line); font-size:7px; }
+    .mm-workflow-tab:hover { color:var(--mm-text); background:var(--mm-bg); }
+    .mm-workflow-tab.active { color:var(--mm-accent); border-bottom-color:var(--mm-accent); }
+    .mm-workspace { min-height:0; flex:1 1 auto; overflow:hidden; }
+    .mm-pane { height:100%; overflow:auto; padding:12px; scroll-padding-top:12px; }
+    .mm-pane-header { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:11px; }
+    .mm-pane-heading { min-width:0; }
+    .mm-pane-heading h2 { margin:0; font-size:16px; line-height:1.15; letter-spacing:-.01em; }
+    .mm-pane-heading p { margin:4px 0 0; color:var(--mm-muted); font-size:10px; line-height:1.4; }
+    .mm-pane-count { flex:0 0 auto; padding:4px 7px; border:1px solid var(--mm-line); border-radius:999px; color:var(--mm-muted); background:var(--mm-panel); font-size:9px; font-weight:760; }
+    .mm-card { margin-bottom:10px; padding:10px; border:1px solid var(--mm-line); border-radius:10px; background:var(--mm-panel); }
+    .mm-card:last-child { margin-bottom:0; }
+    .mm-card-title { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; color:var(--mm-muted); font-size:9px; font-weight:850; letter-spacing:.09em; text-transform:uppercase; }
+    .mm-card-title strong { color:var(--mm-text); font-size:10px; letter-spacing:0; text-transform:none; }
+    .mm-tool-grid-primary { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    .mm-tool-grid-advanced { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top:7px; }
+    .mm-tool-grid-primary .mm-tool { min-height:48px; display:grid; place-items:center; gap:3px; padding:6px 2px; font-size:9px; }
+    .mm-tool-grid-primary .mm-tool .mm-tool-icon { font-size:17px; line-height:1; }
+    .mm-tool-grid-advanced .mm-tool { min-height:36px; }
+    .mm-disclosure { margin-top:8px; border:1px solid var(--mm-line); border-radius:8px; background:var(--mm-bg); }
+    .mm-disclosure > summary { list-style:none; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 9px; cursor:pointer; color:var(--mm-muted); font-size:10px; font-weight:760; }
+    .mm-disclosure > summary::-webkit-details-marker { display:none; }
+    .mm-disclosure > summary::after { content:'+'; font-size:14px; }
+    .mm-disclosure[open] > summary::after { content:'−'; }
+    .mm-disclosure-body { padding:0 8px 8px; }
+    .mm-style-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:7px; margin-top:9px; }
+    .mm-style-line { display:flex; align-items:center; gap:7px; padding:7px 8px; border:1px solid var(--mm-line); border-radius:8px; background:var(--mm-bg); }
+    .mm-style-line span { color:var(--mm-muted); font-size:9px; white-space:nowrap; }
+    .mm-status-strip { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px; align-items:center; margin-bottom:10px; }
+    .mm-status-strip .mm-status { padding:7px 8px; }
+    .mm-drawing-actions { display:flex; gap:5px; }
+    .mm-drawing-actions .mm-btn { padding:7px 9px; white-space:nowrap; }
+    .mm-selection-bar { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px; align-items:center; padding:8px; border:1px solid var(--mm-line); border-radius:9px; background:var(--mm-panel); margin-bottom:10px; }
+    .mm-selection-bar strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; }
+    .mm-selection-bar small { display:block; margin-top:2px; color:var(--mm-muted); font-size:9px; }
+    .mm-selection-actions { display:flex; gap:5px; }
+    .mm-commandbar { flex:0 0 auto; display:flex; align-items:center; gap:5px; padding:7px 9px; border-top:1px solid var(--mm-line); background:var(--mm-panel); }
+    .mm-commandbar .mm-mini-btn { width:30px; height:30px; }
+    .mm-command-spacer { flex:1; }
+    .mm-command-label { max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--mm-muted); font-size:9px; }
+    .mm-command-btn { height:30px; padding:0 9px; border:1px solid var(--mm-line); border-radius:7px; background:transparent; color:var(--mm-text); cursor:pointer; font-size:9px; font-weight:760; }
+    .mm-command-btn:hover { border-color:var(--mm-accent); background:var(--mm-accent-soft); }
+    .mm-command-btn:disabled { opacity:.4; cursor:not-allowed; }
+    .mm-pane .mm-section { margin-bottom:10px; }
+    .mm-pane .mm-section > .mm-section-title { margin-bottom:7px; }
+    .mm-pane-review .mm-list { max-height:none; }
+    .mm-pane-project .mm-textarea { min-height:62px; }
+    .mm-filter-summary { display:flex; align-items:center; gap:6px; }
+    .mm-filter-count { min-width:17px; height:17px; display:grid; place-items:center; border-radius:999px; background:var(--mm-accent-soft); color:var(--mm-accent); font-size:8px; }
+    .mm-system-intro { margin-bottom:10px; padding:9px; border:1px solid var(--mm-line); border-radius:9px; background:var(--mm-panel); color:var(--mm-muted); font-size:10px; line-height:1.45; }
+    @media (max-width: 620px) {
+      #mm-panel { top:8px; right:8px; width:calc(100vw - 16px); height:calc(100vh - 16px); max-height:calc(100vh - 16px); }
+      .mm-contextbar { grid-template-columns:1fr; }
+      .mm-workflow-tab { font-size:8px; }
+      .mm-workflow-tab .mm-tab-icon { font-size:13px; }
+      .mm-tool-grid-primary { grid-template-columns:repeat(3, minmax(0,1fr)); }
+    }
     .mm-hidden { display: none !important; }
     #mm-import { display: none; }
   `;
@@ -541,37 +761,298 @@
   const importInput = document.createElement('input');
   importInput.id = 'mm-import';
   importInput.type = 'file';
-  importInput.accept = '.json,.geojson,.kml,application/json,application/geo+json,application/vnd.google-earth.kml+xml,text/xml,application/xml';
+  importInput.accept = '.mapmark.json,.json,.geojson,.kml,application/json,application/geo+json,application/vnd.google-earth.kml+xml,text/xml,application/xml';
   shadow.appendChild(importInput);
 
-  function loadState() {
+  function loadBootstrapState() {
+    let raw = null;
     try {
-      const stored = GM_getValue(APP.storageKey, null);
-      if (!stored) return DEFAULT_STATE();
-      const parsed = typeof stored === 'string' ? JSON.parse(stored) : stored;
-      return normalizeState(parsed);
+      raw = GM_getValue(APP.storageKey, null);
+      if (!raw) return { state: DEFAULT_STATE(), raw: null, source: 'default', error: null };
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const inspection = validateStateIntegrity(parsed, { strict: Number(parsed?.schema) >= 5 });
+      if (!inspection.valid) return { state: DEFAULT_STATE(), raw, source: 'default', error: `Legacy workspace integrity failure: ${inspection.errors.join(' ')}` };
+      return { state: normalizeState(parsed), raw, source: 'tampermonkey', error: null };
     } catch (error) {
-      console.warn(`[${APP.name}] Could not load saved data.`, error);
-      return DEFAULT_STATE();
+      console.warn(`[${APP.name}] Legacy bootstrap data could not be read.`, error);
+      return { state: DEFAULT_STATE(), raw, source: 'default', error: `Legacy bootstrap error: ${error.message}` };
+    }
+  }
+
+  function checksumText(text) {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}`;
+  }
+
+  function validateStateIntegrity(input, options = {}) {
+    const strict = options.strict !== false;
+    const errors = [];
+    const warnings = [];
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return { valid: false, errors: ['Workspace is not an object.'], warnings };
+    const annotations = Array.isArray(input.annotations) ? input.annotations : [];
+    const collections = Array.isArray(input.collections) ? input.collections : [];
+    const projects = Array.isArray(input.projects) ? input.projects : [];
+    if (!Array.isArray(input.annotations)) errors.push('annotations is not an array.');
+    if (strict && !Array.isArray(input.collections)) errors.push('collections is not an array.');
+    if (strict && !Array.isArray(input.projects)) errors.push('projects is not an array.');
+    const duplicateIds = (items, label) => {
+      const seen = new Set();
+      for (const item of items) {
+        const id = item?.id;
+        if (!id) { errors.push(`${label} contains an item without an id.`); continue; }
+        if (seen.has(String(id))) errors.push(`${label} contains duplicate id ${id}.`);
+        seen.add(String(id));
+      }
+      return seen;
+    };
+    const projectIds = duplicateIds(projects, 'projects');
+    const layerIds = duplicateIds(collections, 'collections');
+    duplicateIds(annotations, 'annotations');
+    if (strict) {
+      for (const layer of collections) if (!projectIds.has(String(layer.projectId))) errors.push(`Layer ${layer.id} references a missing project.`);
+      for (const annotation of annotations) if (!layerIds.has(String(annotation.collectionId))) errors.push(`Annotation ${annotation.id} references a missing layer.`);
+      if (input.activeProjectId && !projectIds.has(String(input.activeProjectId))) warnings.push('Active project reference is stale and will be repaired.');
+      if (input.activeCollectionId && !layerIds.has(String(input.activeCollectionId))) warnings.push('Active layer reference is stale and will be repaired.');
+    }
+    for (const annotation of annotations) {
+      if (!annotation?.geometry || typeof annotation.geometry !== 'object') { errors.push(`Annotation ${annotation?.id || 'unknown'} has no geometry.`); continue; }
+      const geometry = annotation.geometry;
+      const coordinateOkay = value => Array.isArray(value) && value.length >= 2 && Number.isFinite(Number(value[0])) && Number.isFinite(Number(value[1]));
+      if (geometry.type === 'Point' && !coordinateOkay(geometry.coordinates)) errors.push(`Annotation ${annotation.id} has an invalid point.`);
+      if (geometry.type === 'LineString' && (!Array.isArray(geometry.coordinates) || geometry.coordinates.length < 2 || geometry.coordinates.some(value => !coordinateOkay(value)))) errors.push(`Annotation ${annotation.id} has an invalid line.`);
+      if (geometry.type === 'Polygon') {
+        const ring = geometry.coordinates?.[0];
+        if (!Array.isArray(ring) || ring.length < 4 || ring.some(value => !coordinateOkay(value))) errors.push(`Annotation ${annotation.id} has an invalid polygon.`);
+      }
+      if (!['Point', 'LineString', 'Polygon'].includes(geometry.type)) errors.push(`Annotation ${annotation.id} uses unsupported geometry ${geometry.type || 'unknown'}.`);
+    }
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
+  function openStorageDatabase() {
+    return new Promise((resolve, reject) => {
+      if (!('indexedDB' in window)) { reject(new Error('IndexedDB is unavailable in this browser context.')); return; }
+      const request = indexedDB.open(APP.dbName, APP.dbVersion);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('workspaces')) db.createObjectStore('workspaces', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('snapshots')) {
+          const store = db.createObjectStore('snapshots', { keyPath: 'id' });
+          store.createIndex('createdAt', 'createdAt', { unique: false });
+        }
+        if (!db.objectStoreNames.contains('quarantine')) {
+          const store = db.createObjectStore('quarantine', { keyPath: 'id' });
+          store.createIndex('createdAt', 'createdAt', { unique: false });
+        }
+      };
+      request.onsuccess = () => {
+        request.result.onversionchange = () => request.result.close();
+        resolve(request.result);
+      };
+      request.onerror = () => reject(request.error || new Error('IndexedDB could not be opened.'));
+      request.onblocked = () => reject(new Error('IndexedDB upgrade was blocked by another MAPMARK tab.'));
+    });
+  }
+
+  function idbRequest(request) {
+    return new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('IndexedDB request failed.'));
+    });
+  }
+
+  function idbTransactionDone(transaction) {
+    return new Promise((resolve, reject) => {
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error || new Error('IndexedDB transaction failed.'));
+      transaction.onabort = () => reject(transaction.error || new Error('IndexedDB transaction was aborted.'));
+    });
+  }
+
+  async function idbGet(storeName, key) {
+    const transaction = storageRuntime.db.transaction(storeName, 'readonly');
+    return idbRequest(transaction.objectStore(storeName).get(key));
+  }
+
+  async function idbGetAll(storeName) {
+    const transaction = storageRuntime.db.transaction(storeName, 'readonly');
+    return idbRequest(transaction.objectStore(storeName).getAll());
+  }
+
+  async function idbPut(storeName, value) {
+    const transaction = storageRuntime.db.transaction(storeName, 'readwrite');
+    transaction.objectStore(storeName).put(value);
+    await idbTransactionDone(transaction);
+  }
+
+  async function idbDelete(storeName, key) {
+    const transaction = storageRuntime.db.transaction(storeName, 'readwrite');
+    transaction.objectStore(storeName).delete(key);
+    await idbTransactionDone(transaction);
+  }
+
+  function decodeStorageRecord(record) {
+    if (!record || typeof record.payload !== 'string') return { valid: false, error: 'Storage record has no payload.' };
+    const actualChecksum = checksumText(record.payload);
+    if (record.checksum !== actualChecksum) return { valid: false, error: `Checksum mismatch: expected ${record.checksum || 'none'}, calculated ${actualChecksum}.` };
+    try {
+      const parsed = JSON.parse(record.payload);
+      const inspection = validateStateIntegrity(parsed, { strict: Number(parsed.schema) >= 5 });
+      if (!inspection.valid) return { valid: false, error: inspection.errors.join(' '), warnings: inspection.warnings };
+      return { valid: true, state: normalizeState(parsed), warnings: inspection.warnings, checksum: actualChecksum };
+    } catch (error) {
+      return { valid: false, error: `JSON parse failed: ${error.message}` };
+    }
+  }
+
+  async function quarantineStorageRecord(record, reason, source = 'workspace') {
+    if (!storageRuntime.db) return;
+    const payload = typeof record?.payload === 'string' ? record.payload : JSON.stringify(record?.payload ?? record ?? null);
+    await idbPut('quarantine', {
+      id: makeId('quarantine'),
+      source,
+      reason: String(reason || 'Unknown integrity failure'),
+      createdAt: new Date().toISOString(),
+      checksum: checksumText(payload),
+      payload,
+    });
+    storageRuntime.quarantineCount += 1;
+  }
+
+  async function refreshStorageMetadata() {
+    if (!storageRuntime.db) return;
+    const snapshots = (await idbGetAll('snapshots')).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const quarantine = await idbGetAll('quarantine');
+    storageRuntime.snapshots = snapshots.map(item => ({ id: item.id, createdAt: item.createdAt, reason: item.reason, annotationCount: item.annotationCount, checksum: item.checksum }));
+    storageRuntime.snapshotCount = snapshots.length;
+    storageRuntime.quarantineCount = quarantine.length;
+    storageRuntime.lastSnapshotAt = snapshots[0]?.createdAt || null;
+  }
+
+  async function recoverFromSnapshots() {
+    if (!storageRuntime.db) return null;
+    const snapshots = (await idbGetAll('snapshots')).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    for (const snapshot of snapshots) {
+      const decoded = decodeStorageRecord(snapshot);
+      if (decoded.valid) return { state: decoded.state, snapshot };
+      await quarantineStorageRecord(snapshot, decoded.error, 'snapshot');
+      await idbDelete('snapshots', snapshot.id);
+    }
+    return null;
+  }
+
+  async function initializeReliabilityStorage() {
+    try {
+      storageRuntime.db = await openStorageDatabase();
+      storageRuntime.mode = 'IndexedDB';
+      if (bootstrap.error && bootstrap.raw !== null) await quarantineStorageRecord({ payload: typeof bootstrap.raw === 'string' ? bootstrap.raw : JSON.stringify(bootstrap.raw) }, bootstrap.error, 'legacy-tampermonkey');
+      const record = await idbGet('workspaces', APP.workspaceId);
+      if (record) {
+        const decoded = decodeStorageRecord(record);
+        if (decoded.valid) {
+          state = decoded.state;
+          storageRuntime.integrity = 'Verified';
+          storageRuntime.lastSavedAt = record.savedAt || null;
+          storageRuntime.payloadBytes = record.payload.length;
+        } else {
+          await quarantineStorageRecord(record, decoded.error, 'workspace');
+          await idbDelete('workspaces', APP.workspaceId);
+          const recovery = await recoverFromSnapshots();
+          if (recovery) {
+            state = recovery.state;
+            storageRuntime.integrity = 'Recovered';
+            storageRuntime.recoveredFrom = recovery.snapshot.createdAt;
+            storageRuntime.migration = 'Recovered the workspace from a verified snapshot.';
+            await persistStateNow('recovery-restore', { forceSnapshot: false });
+          } else {
+            state = bootstrap.state;
+            storageRuntime.integrity = 'Fallback';
+            storageRuntime.migration = 'The damaged IndexedDB record was quarantined; MAPMARK used the emergency Tampermonkey mirror.';
+            await persistStateNow('fallback-rebuild', { forceSnapshot: true });
+          }
+        }
+      } else {
+        state = normalizeState(bootstrap.state);
+        storageRuntime.integrity = 'Verified';
+        storageRuntime.migration = bootstrap.source === 'tampermonkey'
+          ? 'Migrated the existing MAPMARK workspace into IndexedDB.'
+          : 'Initialized a new IndexedDB workspace.';
+        await persistStateNow('indexeddb-migration', { forceSnapshot: true });
+      }
+      if (pendingFocusCandidate && state.annotations.some(annotation => annotation.id === pendingFocusCandidate)) {
+        pendingFocusId = pendingFocusCandidate;
+        ui.expanded = true;
+        setSelection([pendingFocusCandidate], pendingFocusCandidate, false);
+      }
+      await refreshStorageMetadata();
+      storageRuntime.ready = true;
+      storageRuntime.lastError = null;
+      renderAll();
+    } catch (error) {
+      console.error(`[${APP.name}] IndexedDB initialization failed.`, error);
+      storageRuntime.mode = 'Tampermonkey fallback';
+      storageRuntime.integrity = 'Fallback';
+      storageRuntime.fallbackReason = error.message;
+      storageRuntime.lastError = null;
+      storageRuntime.ready = true;
+      renderAll();
+      setStatus('IndexedDB is unavailable. MAPMARK is using its emergency Tampermonkey storage mirror.', true);
     }
   }
 
   function normalizeState(input) {
     const fresh = DEFAULT_STATE();
     if (!input || typeof input !== 'object') return fresh;
-    const collections = Array.isArray(input.collections) && input.collections.length
-      ? input.collections.filter(item => item && item.id && item.name)
-      : fresh.collections;
-    const activeExists = collections.some(item => item.id === input.activeCollectionId);
+    const legacyProjectId = 'project-default';
+    const rawProjects = Array.isArray(input.projects) && input.projects.length
+      ? input.projects
+      : [{
+          id: legacyProjectId,
+          name: String(input.project?.name || 'Field Project'),
+          description: String(input.project?.description || ''),
+          reference: String(input.project?.reference || ''),
+          status: 'active',
+          createdAt: input.project?.createdAt || new Date().toISOString(),
+          updatedAt: input.project?.updatedAt || new Date().toISOString(),
+        }];
+    const projects = rawProjects.filter(project => project && project.id).map(normalizeProject);
+    if (!projects.length) projects.push(...fresh.projects);
+    const projectIds = new Set(projects.map(project => project.id));
+    const rawCollections = Array.isArray(input.collections) && input.collections.length ? input.collections : fresh.collections;
+    const collections = rawCollections
+      .filter(item => item && item.id && item.name)
+      .map((collection, index) => normalizeLayer(collection, projectIds.has(collection.projectId) ? collection.projectId : projects[0].id, index));
+    if (!collections.length) collections.push(normalizeLayer(fresh.collections[0], projects[0].id, 0));
+    for (const project of projects) {
+      if (!collections.some(layer => layer.projectId === project.id)) {
+        collections.push(normalizeLayer({ id: makeId('layer'), name: 'Field Notes' }, project.id, collections.length));
+      }
+    }
+    const requestedProject = projects.some(project => project.id === input.activeProjectId) ? input.activeProjectId : projects.find(project => project.status !== 'archived')?.id || projects[0].id;
+    const projectLayers = collections.filter(layer => layer.projectId === requestedProject && !layer.archived);
+    const activeCollectionId = projectLayers.some(layer => layer.id === input.activeCollectionId)
+      ? input.activeCollectionId
+      : (projectLayers[0] || collections.find(layer => layer.projectId === requestedProject) || collections[0]).id;
     const register = input.preferences?.register || {};
     const evidence = input.preferences?.evidence || {};
+    const reliability = input.preferences?.reliability || {};
     return {
-      schema: 4,
-      activeCollectionId: activeExists ? input.activeCollectionId : collections[0].id,
+      schema: 6,
+      activeProjectId: requestedProject,
+      activeCollectionId,
       showAllCollections: Boolean(input.showAllCollections),
+      projects,
       collections,
       annotations: Array.isArray(input.annotations)
-        ? input.annotations.filter(isValidAnnotation).map(normalizeAnnotation)
+        ? input.annotations.filter(isValidAnnotation).map(annotation => {
+            const normalized = normalizeAnnotation(annotation);
+            if (!collections.some(layer => layer.id === normalized.collectionId)) normalized.collectionId = activeCollectionId;
+            return normalized;
+          })
         : [],
       preferences: {
         color: COLORS.includes(input.preferences?.color) ? input.preferences.color : fresh.preferences.color,
@@ -579,6 +1060,12 @@
         markerIcon: Object.prototype.hasOwnProperty.call(MARKER_ICONS, input.preferences?.markerIcon) ? input.preferences.markerIcon : fresh.preferences.markerIcon,
         snap: input.preferences?.snap !== false,
         showArchivedOnMap: Boolean(input.preferences?.showArchivedOnMap),
+        showArchivedProjects: Boolean(input.preferences?.showArchivedProjects),
+        importStrategy: Object.prototype.hasOwnProperty.call(IMPORT_STRATEGIES, input.preferences?.importStrategy) ? input.preferences.importStrategy : 'merge',
+        reliability: {
+          automaticSnapshots: reliability.automaticSnapshots !== false,
+          snapshotIntervalMinutes: clamp(Number(reliability.snapshotIntervalMinutes) || 10, 2, 120),
+        },
         evidence: {
           title: String(evidence.title || ''),
           subtitle: String(evidence.subtitle || ''),
@@ -600,6 +1087,34 @@
           sort: Object.prototype.hasOwnProperty.call(REGISTER_SORTS, register.sort) ? register.sort : 'updated-desc',
         },
       },
+    };
+  }
+
+  function normalizeProject(project) {
+    const now = new Date().toISOString();
+    return {
+      id: String(project.id || makeId('project')),
+      name: String(project.name || 'Untitled project'),
+      description: String(project.description || ''),
+      reference: String(project.reference || ''),
+      status: project.status === 'archived' ? 'archived' : 'active',
+      createdAt: project.createdAt || now,
+      updatedAt: project.updatedAt || project.createdAt || now,
+    };
+  }
+
+  function normalizeLayer(layer, projectId, order = 0) {
+    const now = new Date().toISOString();
+    return {
+      id: String(layer.id || makeId('layer')),
+      projectId: String(projectId),
+      name: String(layer.name || 'Untitled layer'),
+      visible: layer.visible !== false,
+      locked: Boolean(layer.locked),
+      archived: Boolean(layer.archived),
+      order: Number.isFinite(Number(layer.order)) ? Number(layer.order) : order,
+      createdAt: layer.createdAt || now,
+      updatedAt: layer.updatedAt || layer.createdAt || now,
     };
   }
 
@@ -626,7 +1141,7 @@
       owner: String(annotation.owner || ''),
       legendLabel: String(annotation.legendLabel || ''),
       markerIcon: Object.prototype.hasOwnProperty.call(MARKER_ICONS, annotation.markerIcon) ? annotation.markerIcon : 'pin',
-      calloutNumber: Number.isFinite(Number(annotation.calloutNumber)) ? Math.max(1, Math.round(Number(annotation.calloutNumber))) : null,
+      calloutNumber: annotation.calloutNumber !== null && annotation.calloutNumber !== '' && Number.isFinite(Number(annotation.calloutNumber)) ? Math.max(1, Math.round(Number(annotation.calloutNumber))) : null,
       showMeasurement: annotation.showMeasurement !== false,
       color: /^#[0-9a-f]{6}$/i.test(annotation.color || '') ? annotation.color : COLORS[0],
       strokeWidth: clamp(Number(annotation.strokeWidth) || 3, 1, 8),
@@ -640,32 +1155,182 @@
     return JSON.parse(JSON.stringify(value));
   }
 
-  function saveStateSoon() {
+  function saveStateSoon(reason = 'autosave') {
     setSaveIndicator(true);
+    storageRuntime.pendingSave = true;
     clearTimeout(ui.saveTimer);
     ui.saveTimer = setTimeout(() => {
-      try {
-        GM_setValue(APP.storageKey, JSON.stringify(state));
-        setSaveIndicator(false);
-      } catch (error) {
+      persistStateNow(reason).catch(error => {
         console.error(`[${APP.name}] Save failed.`, error);
-        setStatus('Save failed. Open the browser console for details.', true);
-      }
+        storageRuntime.lastError = error.message;
+        storageRuntime.pendingSave = false;
+        setSaveIndicator(false, true);
+        setStatus('Save failed. Open Diagnostics for recovery information.', true);
+      });
     }, 220);
   }
 
-  function setSaveIndicator(saving) {
+  async function persistStateNow(reason = 'autosave', options = {}) {
+    const normalized = normalizeState(state);
+    const inspection = validateStateIntegrity(normalized, { strict: true });
+    if (!inspection.valid) throw new Error(`Workspace integrity check failed: ${inspection.errors.join(' ')}`);
+    const payload = JSON.stringify(normalized);
+    const checksum = checksumText(payload);
+    const savedAt = new Date().toISOString();
+    storageRuntime.payloadBytes = payload.length;
+    storageRuntime.saveSequence += 1;
+    storageRuntime.pendingSave = true;
+    if (storageRuntime.db) {
+      await idbPut('workspaces', {
+        id: APP.workspaceId,
+        schema: 6,
+        applicationVersion: APP.version,
+        savedAt,
+        reason,
+        checksum,
+        payload,
+      });
+      storageRuntime.mode = 'IndexedDB';
+      storageRuntime.integrity = 'Verified';
+    } else {
+      storageRuntime.mode = 'Tampermonkey fallback';
+      storageRuntime.integrity = 'Fallback';
+    }
+    try { await Promise.resolve(GM_setValue(APP.storageKey, payload)); } catch (mirrorError) { console.warn(`[${APP.name}] Emergency mirror save failed.`, mirrorError); }
+    storageRuntime.lastSavedAt = savedAt;
+    storageRuntime.lastError = null;
+    storageRuntime.pendingSave = false;
+    setSaveIndicator(false);
+    const reliability = state.preferences.reliability || {};
+    const intervalMs = clamp(Number(reliability.snapshotIntervalMinutes) || 10, 2, 120) * 60 * 1000;
+    const snapshotDue = reliability.automaticSnapshots !== false && (!storageRuntime.lastSnapshotAt || Date.now() - new Date(storageRuntime.lastSnapshotAt).getTime() >= intervalMs);
+    if (storageRuntime.db && (options.forceSnapshot || snapshotDue)) await createRecoverySnapshot(options.snapshotReason || reason, payload, checksum);
+    return { savedAt, checksum, bytes: payload.length };
+  }
+
+  async function createRecoverySnapshot(reason = 'manual', payloadOverride = null, checksumOverride = null) {
+    if (!storageRuntime.db) return null;
+    const payload = payloadOverride || JSON.stringify(normalizeState(state));
+    const checksum = checksumOverride || checksumText(payload);
+    const createdAt = new Date().toISOString();
+    const parsed = JSON.parse(payload);
+    const snapshot = {
+      id: makeId('snapshot'),
+      schema: 6,
+      applicationVersion: APP.version,
+      createdAt,
+      reason: String(reason || 'manual'),
+      checksum,
+      payload,
+      annotationCount: Array.isArray(parsed.annotations) ? parsed.annotations.length : 0,
+      projectCount: Array.isArray(parsed.projects) ? parsed.projects.length : 0,
+    };
+    await idbPut('snapshots', snapshot);
+    storageRuntime.lastSnapshotAt = createdAt;
+    await pruneRecoverySnapshots();
+    await refreshStorageMetadata();
+    if (ui.expanded && ui.diagnosticsOpen) renderShell();
+    return snapshot;
+  }
+
+  function snapshotBeforeDestructiveChange(reason) {
+    if (!storageRuntime.db) return;
+    const payload = JSON.stringify(normalizeState(state));
+    const checksum = checksumText(payload);
+    createRecoverySnapshot(reason, payload, checksum).catch(error => {
+      console.warn(`[${APP.name}] Recovery snapshot could not be created.`, error);
+      storageRuntime.lastError = error.message;
+    });
+  }
+
+  async function pruneRecoverySnapshots() {
+    if (!storageRuntime.db) return;
+    const snapshots = (await idbGetAll('snapshots')).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    await Promise.all(snapshots.slice(APP.maxSnapshots).map(snapshot => idbDelete('snapshots', snapshot.id)));
+  }
+
+  async function verifyStorageIntegrity() {
+    if (!storageRuntime.db) {
+      storageRuntime.integrity = 'Fallback';
+      storageRuntime.lastError = 'IndexedDB is unavailable.';
+      renderShell();
+      return false;
+    }
+    ui.storageBusy = true;
+    renderShell();
+    try {
+      const record = await idbGet('workspaces', APP.workspaceId);
+      const decoded = decodeStorageRecord(record);
+      storageRuntime.integrity = decoded.valid ? 'Verified' : 'Failed';
+      storageRuntime.lastError = decoded.valid ? null : decoded.error;
+      await refreshStorageMetadata();
+      return decoded.valid;
+    } finally {
+      ui.storageBusy = false;
+      renderShell();
+    }
+  }
+
+  async function restoreRecoverySnapshot(snapshotId) {
+    if (!storageRuntime.db || !snapshotId) return;
+    const snapshot = await idbGet('snapshots', snapshotId);
+    const decoded = decodeStorageRecord(snapshot);
+    if (!decoded.valid) {
+      await quarantineStorageRecord(snapshot, decoded.error, 'snapshot');
+      await idbDelete('snapshots', snapshotId);
+      await refreshStorageMetadata();
+      setStatus('That recovery snapshot failed its integrity check and was quarantined.', true);
+      renderShell();
+      return;
+    }
+    snapshotBeforeDestructiveChange('before-snapshot-restore');
+    pushUndo();
+    state = decoded.state;
+    setSelection([], null, false);
+    storageRuntime.recoveredFrom = snapshot.createdAt;
+    storageRuntime.integrity = 'Recovered';
+    ui.restoreSnapshotArmed = null;
+    await persistStateNow('snapshot-restore', { forceSnapshot: false });
+    renderAll();
+    setStatus(`Restored recovery snapshot from ${formatDateTime(snapshot.createdAt)}.`, false);
+  }
+
+  async function rebuildIndexedDb() {
+    const payload = JSON.stringify(normalizeState(state));
+    if (storageRuntime.db) storageRuntime.db.close();
+    storageRuntime.db = null;
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.deleteDatabase(APP.dbName);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error || new Error('IndexedDB could not be rebuilt.'));
+      request.onblocked = () => reject(new Error('Close other Google Maps tabs before rebuilding storage.'));
+    });
+    storageRuntime.db = await openStorageDatabase();
+    storageRuntime.mode = 'IndexedDB';
+    storageRuntime.integrity = 'Verified';
+    state = normalizeState(JSON.parse(payload));
+    ui.rebuildStorageArmed = false;
+    await persistStateNow('storage-rebuild', { forceSnapshot: true, snapshotReason: 'storage-rebuild' });
+    await refreshStorageMetadata();
+    renderAll();
+    setStatus('IndexedDB was rebuilt without changing the current workspace.', false);
+  }
+
+  function setSaveIndicator(saving, failed = false) {
     const save = shadow.querySelector('.mm-save');
     if (!save) return;
     save.classList.toggle('saving', saving);
+    save.classList.toggle('failed', failed);
     const label = save.querySelector('.mm-save-label');
-    if (label) label.textContent = saving ? 'Saving' : 'Saved';
+    if (label) label.textContent = failed ? 'Save failed' : saving ? 'Saving' : 'Saved';
   }
 
   function pushUndo() {
     ui.undo.push(structuredCloneSafe({
       annotations: state.annotations,
       collections: state.collections,
+      projects: state.projects,
+      activeProjectId: state.activeProjectId,
       activeCollectionId: state.activeCollectionId,
     }));
     if (ui.undo.length > 40) ui.undo.shift();
@@ -675,6 +1340,8 @@
   function restoreSnapshot(snapshot) {
     state.annotations = snapshot.annotations;
     state.collections = snapshot.collections;
+    state.projects = snapshot.projects || state.projects;
+    state.activeProjectId = snapshot.activeProjectId || state.activeProjectId;
     state.activeCollectionId = snapshot.activeCollectionId;
     const validSelection = [...selectionSet()].filter(id => findAnnotation(id));
     setSelection(validSelection, validSelection.includes(ui.selectedId) ? ui.selectedId : validSelection[0] || null, false);
@@ -687,6 +1354,8 @@
     ui.redo.push(structuredCloneSafe({
       annotations: state.annotations,
       collections: state.collections,
+      projects: state.projects,
+      activeProjectId: state.activeProjectId,
       activeCollectionId: state.activeCollectionId,
     }));
     restoreSnapshot(ui.undo.pop());
@@ -697,6 +1366,8 @@
     ui.undo.push(structuredCloneSafe({
       annotations: state.annotations,
       collections: state.collections,
+      projects: state.projects,
+      activeProjectId: state.activeProjectId,
       activeCollectionId: state.activeCollectionId,
     }));
     restoreSnapshot(ui.redo.pop());
@@ -754,103 +1425,33 @@
     const selected = findAnnotation(ui.selectedId);
     const selectionCount = selectedList.length;
     const evidenceCount = evidenceAnnotations().length;
-    const status = mapStatus();
+    const openReviewCount = annotationsForProject(currentProject()?.id).filter(annotation => annotation.status === 'open' || annotation.status === 'review').length;
+    const storageNeedsAttention = Boolean(storageRuntime.lastError || storageRuntime.fallbackReason || storageRuntime.integrity === 'Failed');
 
     shell.innerHTML = ui.expanded ? `
-      <aside id="mm-panel" aria-label="${APP.name} controls">
+      <aside id="mm-panel" aria-label="${APP.name} controls" data-workspace="${escapeAttr(ui.workspace)}">
         <header class="mm-header">
           <div class="mm-brand">
             <strong>${APP.name}</strong>
             <span class="mm-version">v${APP.version}</span>
-            <span class="mm-save"><span class="mm-save-dot"></span><span class="mm-save-label">Saved</span></span>
+            <span class="mm-save ${storageRuntime.pendingSave ? 'saving' : storageRuntime.lastError ? 'failed' : ''}"><span class="mm-save-dot"></span><span class="mm-save-label">${storageRuntime.lastError ? 'Save issue' : storageRuntime.pendingSave ? 'Saving' : 'Saved'}</span></span>
           </div>
-          <button class="mm-icon-btn" data-action="collapse" title="Collapse (Alt+Shift+M)" aria-label="Collapse">×</button>
+          <div class="mm-header-actions">
+            <button class="mm-icon-btn" data-action="collapse" title="Collapse (Alt+Shift+M)" aria-label="Collapse">×</button>
+          </div>
         </header>
-        <div class="mm-scroll">
-          <section class="mm-section">
-            <div class="mm-section-title"><span>Map set</span><span>${state.annotations.length} total</span></div>
-            <div class="mm-row">
-              <select class="mm-select" id="mm-collection" aria-label="Active map set">
-                ${state.collections.map(collection => `<option value="${escapeAttr(collection.id)}" ${collection.id === state.activeCollectionId ? 'selected' : ''}>${escapeHtml(collection.name)}</option>`).join('')}
-              </select>
-              <button class="mm-icon-btn" data-action="new-collection" title="New map set" aria-label="New map set">+</button>
-            </div>
-            ${ui.newCollectionOpen ? `
-              <div class="mm-new-collection">
-                <input class="mm-field" id="mm-new-collection-name" maxlength="80" placeholder="Map set name">
-                <button class="mm-btn primary" data-action="add-collection">Add</button>
-                <button class="mm-btn" data-action="cancel-collection">Cancel</button>
-              </div>
-            ` : ''}
-            <label class="mm-check" style="margin-top:7px"><input id="mm-show-all" type="checkbox" ${state.showAllCollections ? 'checked' : ''}> Show annotations from every map set</label>
-            <label class="mm-check" style="margin-top:7px"><input id="mm-show-archived" type="checkbox" ${state.preferences.showArchivedOnMap ? 'checked' : ''}> Show archived annotations on map</label>
-          </section>
-
-          <section class="mm-section">
-            <div class="mm-section-title"><span>Tools</span><span>${escapeHtml(TOOL_LABELS[ui.tool])}</span></div>
-            <div class="mm-tools">
-              ${toolButton('select', '↖', 'Select')}
-              ${toolButton('note', '●', 'Note')}
-              ${toolButton('callout', '①', 'Callout')}
-              ${toolButton('marker', '◆', 'Marker')}
-              ${toolButton('label', 'T', 'Label')}
-              ${toolButton('arrow', '→', 'Arrow')}
-              ${toolButton('route', '⌁', 'Route')}
-              ${toolButton('box', '□', 'Box')}
-              ${toolButton('polygon', '⬡', 'Polygon')}
-              ${toolButton('circle', '○', 'Circle')}
-              ${toolButton('pen', '〰', 'Draw')}
-            </div>
-          </section>
-
-          <section class="mm-section">
-            <div class="mm-section-title"><span>Style</span><span id="mm-stroke-value">${state.preferences.strokeWidth}px</span></div>
-            <div class="mm-colors">
-              ${COLORS.map(color => `<button class="mm-color ${state.preferences.color === color ? 'active' : ''}" data-color="${color}" style="background:${color}" title="${color}" aria-label="Use ${color}"></button>`).join('')}
-            </div>
-            <div class="mm-row" style="margin-top:9px">
-              <span style="font-size:10px;color:var(--mm-muted)">Line</span>
-              <input class="mm-range" id="mm-stroke" type="range" min="1" max="8" step="1" value="${state.preferences.strokeWidth}" aria-label="Line width">
-            </div>
-            <label class="mm-label" style="margin-top:8px">Marker symbol
-              <select class="mm-select" id="mm-marker-icon">
-                ${Object.entries(MARKER_ICONS).map(([value, icon]) => `<option value="${value}" ${state.preferences.markerIcon === value ? 'selected' : ''}>${escapeHtml(icon.glyph)} ${escapeHtml(icon.label)}</option>`).join('')}
-              </select>
-            </label>
-            <label class="mm-check" style="margin-top:8px"><input id="mm-snap" type="checkbox" ${state.preferences.snap ? 'checked' : ''}> Snap to nearby annotation anchors and visible map markers</label>
-          </section>
-
-          <section class="mm-section">
-            <div class="mm-section-title"><span>Map status</span><span>${formatZoom(ui.mapView?.zoom)}</span></div>
-            <div class="mm-status ${status.warn ? 'warn' : ''}" id="mm-status">${escapeHtml(status.message)}</div>
-            ${ui.drawing && ['route','polygon'].includes(ui.drawing.type) ? `<div class="mm-row" style="margin-top:6px"><button class="mm-btn primary" data-action="finish-drawing">Finish ${escapeHtml(TOOL_LABELS[ui.drawing.type])}</button><button class="mm-btn" data-action="cancel-drawing">Cancel</button></div>` : ''}
-          </section>
-
-          ${registerMarkup(registerAnnotations, registerMetricsData, selectionCount)}
-
-          <section class="mm-section">
-            <div class="mm-section-title"><span>Inspector</span><span>${selectionCount > 1 ? `${selectionCount} selected` : selected ? escapeHtml(TOOL_LABELS[selected.type] || selected.type) : 'None'}</span></div>
-            ${selectionCount > 1 ? multiInspectorMarkup(selectedList) : selected ? inspectorMarkup(selected) : '<div class="mm-empty">Select an annotation to edit it. Shift-click annotations or register entries to build a multi-selection.</div>'}
-          </section>
-
-          ${evidenceMarkup(evidenceCount)}
-
-          <section class="mm-section">
-            <div class="mm-section-title"><span>Data</span><span>Local only</span></div>
-            <div class="mm-actions">
-              <button class="mm-btn" data-action="undo" ${ui.undo.length ? '' : 'disabled'}>Undo</button>
-              <button class="mm-btn" data-action="redo" ${ui.redo.length ? '' : 'disabled'}>Redo</button>
-              <button class="mm-btn" data-action="toggle-hidden">${ui.hidden ? 'Show markup' : 'Hide markup'}</button>
-              <button class="mm-btn" data-action="copy-package">Copy package</button>
-              <button class="mm-btn" data-action="export-json">Export JSON</button>
-              <button class="mm-btn" data-action="export-geojson">Export GeoJSON</button>
-              <button class="mm-btn" data-action="export-kml">Export KML</button>
-              <button class="mm-btn" data-action="import">Import JSON / GeoJSON / KML</button>
-              <button class="mm-btn danger" data-action="clear">${ui.clearArmed ? 'Confirm clear' : 'Clear map set'}</button>
-            </div>
-          </section>
-        </div>
-        <footer class="mm-footer">Rich geographic markup is stored as portable coordinates. Routes, polygons, and circles include measurements; JSON, GeoJSON, KML, Markdown, CSV, PNG, and printable reports remain local to the browser.</footer>
+        ${workflowContextMarkup()}
+        <nav class="mm-workflow-tabs" aria-label="MAPMARK workflow">
+          ${workflowTab('annotate', '✎', 'Annotate')}
+          ${workflowTab('review', '☷', 'Review', openReviewCount)}
+          ${workflowTab('evidence', '▣', 'Evidence')}
+          ${workflowTab('project', '▤', 'Project')}
+          ${workflowTab('system', '⚙', 'System', storageNeedsAttention ? '!' : '')}
+        </nav>
+        <main class="mm-workspace">
+          ${workflowPaneMarkup({ visibleAnnotations, registerAnnotations, registerMetricsData, selectedList, selected, selectionCount, evidenceCount })}
+        </main>
+        ${commandBarMarkup(selectionCount)}
       </aside>
     ` : `
       <nav id="mm-collapsed" aria-label="${APP.name} quick tools">
@@ -871,6 +1472,332 @@
     `;
 
     bindShellEvents();
+  }
+
+  function workflowContextMarkup() {
+    const projects = availableProjects();
+    const layers = projectLayers(true);
+    return `
+      <div class="mm-contextbar">
+        <div class="mm-context-field">
+          <label>Project
+            <select class="mm-select" id="mm-project" aria-label="Active project">
+              ${projects.map(item => `<option value="${escapeAttr(item.id)}" ${item.id === state.activeProjectId ? 'selected' : ''}>${item.status === 'archived' ? 'Archive · ' : ''}${escapeHtml(item.name)}</option>`).join('')}
+            </select>
+          </label>
+          <button class="mm-mini-btn" data-action="new-project" title="Create project" aria-label="Create project">+</button>
+        </div>
+        <div class="mm-context-field">
+          <label>Active layer
+            <select class="mm-select" id="mm-collection" aria-label="Active map layer">
+              ${layers.map(layer => `<option value="${escapeAttr(layer.id)}" ${layer.id === state.activeCollectionId ? 'selected' : ''}>${layer.archived ? 'Archive · ' : ''}${layer.locked ? 'Locked · ' : ''}${escapeHtml(layer.name)}</option>`).join('')}
+            </select>
+          </label>
+          <button class="mm-mini-btn" data-action="new-collection" title="Create layer" aria-label="Create layer">+</button>
+        </div>
+      </div>`;
+  }
+
+  function workflowTab(workspace, icon, label, badge = '') {
+    return `<button class="mm-workflow-tab ${ui.workspace === workspace ? 'active' : ''}" data-action="set-workspace" data-workspace="${workspace}" aria-current="${ui.workspace === workspace ? 'page' : 'false'}"><span class="mm-tab-icon">${icon}</span><span>${label}</span>${badge !== '' && Number(badge) !== 0 ? `<span class="mm-tab-badge">${escapeHtml(badge)}</span>` : ''}</button>`;
+  }
+
+  function workflowPaneMarkup(context) {
+    switch (ui.workspace) {
+      case 'review': return reviewWorkspaceMarkup(context);
+      case 'evidence': return evidenceWorkspaceMarkup(context);
+      case 'project': return projectWorkspacePaneMarkup(context);
+      case 'system': return systemWorkspaceMarkup(context);
+      default: return annotateWorkspaceMarkup(context);
+    }
+  }
+
+  function paneHeader(title, description, count = '') {
+    return `<div class="mm-pane-header"><div class="mm-pane-heading"><h2>${escapeHtml(title)}</h2><p>${escapeHtml(description)}</p></div>${count !== '' ? `<span class="mm-pane-count">${escapeHtml(count)}</span>` : ''}</div>`;
+  }
+
+  function annotateWorkspaceMarkup({ selectedList, selected, selectionCount, visibleAnnotations }) {
+    const status = mapStatus();
+    const advancedTools = ['arrow', 'route', 'box', 'polygon', 'circle', 'pen'];
+    const advancedOpen = advancedTools.includes(ui.tool);
+    const markerRelevant = ui.tool === 'marker' || selectedList.some(annotation => annotation.type === 'marker');
+    return `
+      <div class="mm-pane mm-pane-annotate" data-pane="annotate">
+        ${paneHeader('Annotate the map', 'Choose a tool, place markup, then refine the selected annotation.', `${visibleAnnotations.length} visible`)}
+        <div class="mm-status-strip">
+          <div class="mm-status ${status.warn ? 'warn' : ''}" id="mm-status">${escapeHtml(status.message)} · ${escapeHtml(formatZoom(ui.mapView?.zoom))}</div>
+          ${ui.drawing && ['route','polygon'].includes(ui.drawing.type) ? `<div class="mm-drawing-actions"><button class="mm-btn primary" data-action="finish-drawing">Finish</button><button class="mm-btn" data-action="cancel-drawing">Cancel</button></div>` : ''}
+        </div>
+
+        <section class="mm-card">
+          <div class="mm-card-title"><span>Choose a tool</span><strong>${escapeHtml(TOOL_LABELS[ui.tool])}</strong></div>
+          <div class="mm-tools mm-tool-grid-primary">
+            ${toolButtonRich('select', '↖', 'Select')}
+            ${toolButtonRich('note', '●', 'Note')}
+            ${toolButtonRich('callout', '①', 'Callout')}
+            ${toolButtonRich('marker', '◆', 'Marker')}
+            ${toolButtonRich('label', 'T', 'Label')}
+          </div>
+          <details class="mm-disclosure" ${advancedOpen ? 'open' : ''}>
+            <summary><span>Lines, shapes, and freehand</span><span>6 tools</span></summary>
+            <div class="mm-disclosure-body">
+              <div class="mm-tools mm-tool-grid-advanced">
+                ${toolButton('arrow', '→', 'Arrow')}
+                ${toolButton('route', '⌁', 'Route')}
+                ${toolButton('box', '□', 'Box')}
+                ${toolButton('polygon', '⬡', 'Polygon')}
+                ${toolButton('circle', '○', 'Circle')}
+                ${toolButton('pen', '〰', 'Draw')}
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="mm-card">
+          <div class="mm-card-title"><span>Appearance</span><strong id="mm-stroke-value">${state.preferences.strokeWidth}px line</strong></div>
+          <div class="mm-colors">
+            ${COLORS.map(color => `<button class="mm-color ${state.preferences.color === color ? 'active' : ''}" data-color="${color}" style="background:${color}" title="${color}" aria-label="Use ${color}"></button>`).join('')}
+          </div>
+          <div class="mm-style-grid">
+            <div class="mm-style-line"><span>Line</span><input class="mm-range" id="mm-stroke" type="range" min="1" max="8" step="1" value="${state.preferences.strokeWidth}" aria-label="Line width"></div>
+            ${markerRelevant ? `<label class="mm-label">Marker symbol<select class="mm-select" id="mm-marker-icon">${Object.entries(MARKER_ICONS).map(([value, icon]) => `<option value="${value}" ${state.preferences.markerIcon === value ? 'selected' : ''}>${escapeHtml(icon.glyph)} ${escapeHtml(icon.label)}</option>`).join('')}</select></label>` : '<div class="mm-help">Color and line width apply to new markup and the current editable selection.</div>'}
+          </div>
+          <label class="mm-check" style="margin-top:8px"><input id="mm-snap" type="checkbox" ${state.preferences.snap ? 'checked' : ''}> Snap to nearby annotation anchors and map markers</label>
+        </section>
+
+        <section class="mm-card">
+          <div class="mm-card-title"><span>Selection details</span><strong>${selectionCount > 1 ? `${selectionCount} selected` : selected ? escapeHtml(TOOL_LABELS[selected.type] || selected.type) : 'Nothing selected'}</strong></div>
+          ${selectionCount > 1 ? multiInspectorMarkup(selectedList) : selected ? inspectorMarkup(selected) : '<div class="mm-empty">Select map markup to edit its title, workflow fields, notes, geometry, and layer. Shift-click to select several items.</div>'}
+        </section>
+      </div>`;
+  }
+
+  function toolButtonRich(tool, icon, label) {
+    return `<button class="mm-tool ${ui.tool === tool ? 'active' : ''}" data-tool="${tool}" title="${label}"><span class="mm-tool-icon">${icon}</span><span>${label}</span></button>`;
+  }
+
+  function reviewWorkspaceMarkup({ registerAnnotations, registerMetricsData, selectedList, selected, selectionCount }) {
+    return `
+      <div class="mm-pane mm-pane-review" data-pane="review">
+        ${paneHeader('Review and resolve', 'Find annotations, assign workflow fields, and move open items toward resolution.', `${registerAnnotations.length} ${registerAnnotations.length === 1 ? 'result' : 'results'}`)}
+        ${reviewSelectionMarkup(selectedList, selected, selectionCount)}
+        ${registerMarkup(registerAnnotations, registerMetricsData, selectionCount)}
+      </div>`;
+  }
+
+  function reviewSelectionMarkup(selectedList, selected, selectionCount) {
+    if (!selectionCount) return '';
+    const title = selectionCount > 1 ? `${selectionCount} annotations selected` : selected?.title || defaultTitle(selected?.type);
+    const meta = selectionCount > 1 ? 'Bulk workflow controls are available below.' : `${STATUS_LABELS[selected.status]} · ${PRIORITY_LABELS[selected.priority]} · ${TOOL_LABELS[selected.type]}`;
+    return `<div class="mm-selection-bar"><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(meta)}</small></div><div class="mm-selection-actions"><button class="mm-mini-btn" data-action="focus-selected" title="Zoom to selection">◎</button><button class="mm-command-btn" data-action="edit-selection">Edit details</button></div></div>`;
+  }
+
+  function evidenceWorkspaceMarkup({ evidenceCount }) {
+    return `
+      <div class="mm-pane mm-pane-evidence" data-pane="evidence">
+        ${paneHeader('Capture evidence', 'Choose the annotation scope once, then create consistent images, reports, and data exports.', `${evidenceCount} scoped`)}
+        ${evidenceMarkup(evidenceCount)}
+      </div>`;
+  }
+
+  function projectWorkspacePaneMarkup() {
+    return `
+      <div class="mm-pane mm-pane-project" data-pane="project">
+        ${paneHeader('Organize the work', 'Manage project metadata, map layers, packages, imports, and portable backups.')}
+        ${projectWorkspaceMarkup()}
+        ${layerManagerMarkup()}
+        ${dataManagementMarkup()}
+      </div>`;
+  }
+
+  function systemWorkspaceMarkup() {
+    return `
+      <div class="mm-pane mm-pane-system" data-pane="system">
+        ${paneHeader('Storage and diagnostics', 'Verify local storage, create recovery points, and inspect map compatibility without exposing annotation contents.')}
+        <div class="mm-system-intro">MAPMARK normally manages reliability automatically. Use these controls only when checking storage health, restoring a recovery point, or diagnosing alignment.</div>
+        ${diagnosticsMarkup(true)}
+      </div>`;
+  }
+
+  function commandBarMarkup(selectionCount) {
+    return `<footer class="mm-commandbar"><button class="mm-mini-btn" data-action="undo" ${ui.undo.length ? '' : 'disabled'} title="Undo (Ctrl/Cmd+Z)">↶</button><button class="mm-mini-btn" data-action="redo" ${ui.redo.length ? '' : 'disabled'} title="Redo (Ctrl/Cmd+Shift+Z)">↷</button><button class="mm-command-btn" data-action="toggle-hidden">${ui.hidden ? 'Show markup' : 'Hide markup'}</button><span class="mm-command-spacer"></span><span class="mm-command-label">${selectionCount ? `${selectionCount} selected` : `${annotationsForCurrentCollection().length} visible`}</span>${selectionCount ? `<button class="mm-command-btn" data-action="clear-selection">Clear selection</button>` : ''}</footer>`;
+  }
+
+  function diagnosticsMarkup(forceOpen = false) {
+    const environment = ui.mapEnvironment || {};
+    const detection = ui.mapDetection || {};
+    const reliability = state.preferences.reliability || {};
+    const recentSnapshots = storageRuntime.snapshots.slice(0, 5);
+    const storageWarn = storageRuntime.lastError || storageRuntime.fallbackReason || storageRuntime.integrity === 'Failed';
+    const diagnosticsOpen = forceOpen || ui.diagnosticsOpen;
+    return `
+      <section class="mm-section" id="mm-diagnostics-section">
+        <div class="mm-section-title"><span>Reliability</span>${forceOpen ? '<span>Automatic safeguards</span>' : `<button class="mm-mini-btn ${diagnosticsOpen ? 'active' : ''}" data-action="toggle-diagnostics" title="${diagnosticsOpen ? 'Hide' : 'Open'} diagnostics">${diagnosticsOpen ? '−' : '⋯'}</button>`}</div>
+        ${!environment.supported && environment.mode !== 'unknown' ? `<div class="mm-warning-banner">${escapeHtml(environment.reason || 'This Google Maps view is not safe for geographic overlay alignment.')}</div>` : ''}
+        ${storageRuntime.migration ? `<div class="mm-import-report">${escapeHtml(storageRuntime.migration)}</div>` : ''}
+        ${diagnosticsOpen ? `
+          <div class="mm-diagnostics">
+            ${storageWarn ? `<div class="mm-warning-banner">${escapeHtml(storageRuntime.lastError || storageRuntime.fallbackReason || 'The current storage record did not pass integrity verification.')}</div>` : ''}
+            <div class="mm-diag-grid">
+              ${diagnosticItem('Storage', storageRuntime.mode)}
+              ${diagnosticItem('Integrity', storageRuntime.integrity)}
+              ${diagnosticItem('Last saved', storageRuntime.lastSavedAt ? formatDateTime(storageRuntime.lastSavedAt) : 'Not yet')}
+              ${diagnosticItem('Workspace size', formatBytes(storageRuntime.payloadBytes))}
+              ${diagnosticItem('Snapshots', String(storageRuntime.snapshotCount))}
+              ${diagnosticItem('Quarantine', String(storageRuntime.quarantineCount))}
+              ${diagnosticItem('Map mode', environment.mode || 'unknown')}
+              ${diagnosticItem('Canvas candidates', String(detection.candidates || 0))}
+            </div>
+            <label class="mm-check"><input id="mm-auto-snapshots" type="checkbox" ${reliability.automaticSnapshots !== false ? 'checked' : ''}> Automatic recovery snapshots</label>
+            <label class="mm-label">Snapshot interval
+              <select class="mm-select" id="mm-snapshot-interval">
+                ${[2,5,10,15,30,60,120].map(value => `<option value="${value}" ${Number(reliability.snapshotIntervalMinutes) === value ? 'selected' : ''}>${value} minutes</option>`).join('')}
+              </select>
+            </label>
+            <div class="mm-actions">
+              <button class="mm-btn" data-action="verify-storage" ${ui.storageBusy ? 'disabled' : ''}>Verify storage</button>
+              <button class="mm-btn" data-action="create-snapshot" ${ui.storageBusy || !storageRuntime.db ? 'disabled' : ''}>Create snapshot</button>
+              <button class="mm-btn" data-action="export-diagnostics">Export diagnostics</button>
+              <button class="mm-btn ${ui.rebuildStorageArmed ? 'danger' : ''}" data-action="rebuild-storage" ${ui.storageBusy ? 'disabled' : ''}>${ui.rebuildStorageArmed ? 'Confirm rebuild' : 'Rebuild storage'}</button>
+            </div>
+            <div class="mm-help">Map detection: ${escapeHtml(detection.source || 'none')} · score ${Number(detection.score || 0).toFixed(1)}. Overlay rendering is blocked in Street View, tilted, rotated, and 3D scenes.</div>
+            <div class="mm-section-title" style="margin-top:2px"><span>Recovery snapshots</span><span>${storageRuntime.snapshotCount}</span></div>
+            ${recentSnapshots.length ? `<div class="mm-diag-log">${recentSnapshots.map(snapshot => `<div class="mm-diag-row"><div><strong>${escapeHtml(formatDateTime(snapshot.createdAt))}</strong><small>${escapeHtml(snapshot.reason || 'automatic')} · ${Number(snapshot.annotationCount || 0)} annotations</small></div><button class="mm-mini-btn ${ui.restoreSnapshotArmed === snapshot.id ? 'active' : ''}" data-action="restore-snapshot" data-snapshot-id="${escapeAttr(snapshot.id)}" title="${ui.restoreSnapshotArmed === snapshot.id ? 'Confirm restore' : 'Restore snapshot'}">${ui.restoreSnapshotArmed === snapshot.id ? '✓' : '↩'}</button></div>`).join('')}</div>` : '<div class="mm-empty">No recovery snapshots yet.</div>'}
+            ${storageRuntime.recoveredFrom ? `<div class="mm-help">Last recovery source: ${escapeHtml(formatDateTime(storageRuntime.recoveredFrom))}</div>` : ''}
+          </div>
+        ` : `<div class="mm-help">${escapeHtml(storageRuntime.mode)} · ${escapeHtml(storageRuntime.integrity)} · ${storageRuntime.snapshotCount} snapshots</div>`}
+      </section>`;
+  }
+
+  function diagnosticItem(label, value) {
+    return `<div class="mm-diag-item"><span>${escapeHtml(label)}</span><strong title="${escapeAttr(value)}">${escapeHtml(value)}</strong></div>`;
+  }
+
+  function formatBytes(bytes) {
+    const value = Number(bytes) || 0;
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${(value / (1024 * 1024)).toFixed(2)} MB`;
+  }
+
+  function buildDiagnosticsReport() {
+    const inspection = validateStateIntegrity(state, { strict: true });
+    return {
+      application: APP.name,
+      applicationVersion: APP.version,
+      generatedAt: new Date().toISOString(),
+      sourceUrl: location.href,
+      browser: navigator.userAgent,
+      viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio || 1 },
+      storage: {
+        mode: storageRuntime.mode,
+        ready: storageRuntime.ready,
+        integrity: storageRuntime.integrity,
+        lastSavedAt: storageRuntime.lastSavedAt,
+        lastSnapshotAt: storageRuntime.lastSnapshotAt,
+        recoveredFrom: storageRuntime.recoveredFrom,
+        migration: storageRuntime.migration,
+        payloadBytes: storageRuntime.payloadBytes,
+        snapshotCount: storageRuntime.snapshotCount,
+        quarantineCount: storageRuntime.quarantineCount,
+        lastError: storageRuntime.lastError,
+        fallbackReason: storageRuntime.fallbackReason,
+      },
+      map: {
+        view: ui.mapView ? { ...ui.mapView } : null,
+        rectangle: ui.mapRect ? { ...ui.mapRect } : null,
+        environment: structuredCloneSafe(ui.mapEnvironment),
+        detection: structuredCloneSafe(ui.mapDetection),
+      },
+      workspace: {
+        schema: state.schema,
+        projects: state.projects.length,
+        layers: state.collections.length,
+        annotations: state.annotations.length,
+        integrityValid: inspection.valid,
+        integrityErrors: inspection.errors,
+        integrityWarnings: inspection.warnings,
+      },
+      snapshots: structuredCloneSafe(storageRuntime.snapshots),
+    };
+  }
+
+  function exportDiagnostics() {
+    downloadJson(buildDiagnosticsReport(), `mapmark-diagnostics-${dateStamp()}.json`);
+    setStatus('Diagnostics report exported without annotation contents.', false);
+  }
+
+  function projectWorkspaceMarkup() {
+    const project = currentProject();
+    const projectAnnotationCount = annotationsForProject(project?.id).length;
+    return `
+      <section class="mm-section" id="mm-project-section">
+        <div class="mm-section-title"><span>Project package</span><span>${project?.status === 'archived' ? 'Archived' : 'Active'}</span></div>
+        ${ui.newProjectOpen ? `
+          <div class="mm-project-card" style="margin-bottom:7px">
+            <input class="mm-field" id="mm-new-project-name" maxlength="100" placeholder="Project name">
+            <select class="mm-select" id="mm-project-template">${Object.entries(PROJECT_TEMPLATES).map(([value, template]) => `<option value="${value}">${escapeHtml(template.label)}</option>`).join('')}</select>
+            <div class="mm-row"><button class="mm-btn primary" data-action="add-project">Create project</button><button class="mm-btn" data-action="cancel-project">Cancel</button></div>
+          </div>
+        ` : ''}
+        ${project ? `
+          <div class="mm-project-card">
+            <div class="mm-row" style="justify-content:space-between"><strong>${projectAnnotationCount} ${projectAnnotationCount === 1 ? 'annotation' : 'annotations'}</strong><span class="mm-chip">${project.status === 'archived' ? 'Archived package' : 'Active package'}</span></div>
+            ${project.status === 'archived' ? '<div class="mm-lock-banner">This project is archived. Restore it before adding or editing annotations.</div>' : ''}
+            <label class="mm-label">Project name<input class="mm-field" id="mm-project-name" maxlength="100" value="${escapeAttr(project.name)}"></label>
+            <label class="mm-label">Description<textarea class="mm-textarea" id="mm-project-description" maxlength="1200" placeholder="Purpose, location, scope, or review context">${escapeHtml(project.description)}</textarea></label>
+            <label class="mm-label">Reference<input class="mm-field" id="mm-project-reference" maxlength="160" value="${escapeAttr(project.reference)}" placeholder="Project, case, or work order"></label>
+            <div class="mm-actions">
+              <button class="mm-btn" data-action="export-project">Export project package</button>
+              <button class="mm-btn ${project.status === 'archived' ? '' : 'danger'}" data-action="${project.status === 'archived' ? 'restore-project' : 'archive-project'}">${project.status === 'archived' ? 'Restore project' : ui.projectArchiveArmed ? 'Confirm archive' : 'Archive project'}</button>
+            </div>
+          </div>
+        ` : ''}
+        <label class="mm-check" style="margin-top:7px"><input id="mm-show-archived-projects" type="checkbox" ${state.preferences.showArchivedProjects ? 'checked' : ''}> Include archived projects in the project selector</label>
+      </section>`;
+  }
+
+  function layerManagerMarkup() {
+    const layers = projectLayers(true);
+    const active = activeLayer();
+    return `
+      <section class="mm-section" id="mm-layer-section">
+        <div class="mm-section-title"><span>Map layers</span><span>${layers.filter(layer => !layer.archived).length} active</span></div>
+        ${ui.newCollectionOpen ? `
+          <div class="mm-new-collection" style="margin-bottom:7px">
+            <input class="mm-field" id="mm-new-collection-name" maxlength="80" placeholder="Layer name">
+            <button class="mm-btn primary" data-action="add-collection">Add layer</button>
+            <button class="mm-btn" data-action="cancel-collection">Cancel</button>
+          </div>
+        ` : ''}
+        ${active?.locked ? '<div class="mm-lock-banner" style="margin-bottom:7px">The active layer is locked. Its annotations remain visible and selectable, but cannot be changed.</div>' : ''}
+        <div class="mm-layer-list">
+          ${layers.map(layer => `<div class="mm-layer-row ${layer.id === state.activeCollectionId ? 'active' : ''}" data-layer-row="${escapeAttr(layer.id)}"><button class="mm-layer-name" data-action="activate-layer" data-layer-id="${escapeAttr(layer.id)}" title="Make active">${escapeHtml(layer.name)}</button><button class="mm-mini-btn ${layer.visible ? 'active' : ''}" data-action="toggle-layer-visible" data-layer-id="${escapeAttr(layer.id)}" title="${layer.visible ? 'Hide' : 'Show'} layer">${layer.visible ? '◉' : '○'}</button><button class="mm-mini-btn ${layer.locked ? 'active' : ''}" data-action="toggle-layer-lock" data-layer-id="${escapeAttr(layer.id)}" title="${layer.locked ? 'Unlock' : 'Lock'} layer">${layer.locked ? '🔒' : '🔓'}</button><button class="mm-mini-btn" data-action="archive-layer" data-layer-id="${escapeAttr(layer.id)}" title="${layer.archived ? 'Restore' : 'Archive'} layer">${layer.archived ? '↩' : '⌫'}</button></div>`).join('')}
+        </div>
+        <div class="mm-row" style="margin-top:8px;align-items:flex-start;flex-wrap:wrap">
+          <label class="mm-check"><input id="mm-show-all" type="checkbox" ${state.showAllCollections ? 'checked' : ''}> Show all visible layers</label>
+          <label class="mm-check"><input id="mm-show-archived" type="checkbox" ${state.preferences.showArchivedOnMap ? 'checked' : ''}> Show archived annotations</label>
+        </div>
+      </section>`;
+  }
+
+  function dataManagementMarkup() {
+    return `
+      <section class="mm-section" id="mm-data-section">
+        <div class="mm-section-title"><span>Exchange and backup</span><span>Local only</span></div>
+        <label class="mm-label">When importing a project package
+          <select class="mm-select" id="mm-import-strategy">${Object.entries(IMPORT_STRATEGIES).map(([value, label]) => `<option value="${value}" ${state.preferences.importStrategy === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select>
+        </label>
+        ${ui.lastImportReport ? `<div class="mm-import-report" style="margin-top:7px">${escapeHtml(formatImportReport(ui.lastImportReport))}</div>` : ''}
+        <div class="mm-actions" style="margin-top:8px">
+          <button class="mm-btn" data-action="import">Import package / GeoJSON / KML</button>
+          <button class="mm-btn" data-action="export-json">Export workspace backup</button>
+          <button class="mm-btn" data-action="copy-package">Copy selected package</button>
+          <button class="mm-btn" data-action="export-geojson">Export GeoJSON</button>
+          <button class="mm-btn" data-action="export-kml">Export KML</button>
+          <button class="mm-btn danger" data-action="clear">${ui.clearArmed ? 'Confirm clear layer' : 'Clear active layer'}</button>
+        </div>
+      </section>`;
   }
 
   function evidenceMarkup(evidenceCount) {
@@ -920,44 +1847,48 @@
 
   function registerMarkup(annotations, metrics, selectionCount) {
     const register = state.preferences.register;
+    const activeFilterCount = [register.type !== 'all', register.priority !== 'all', register.color !== 'all', register.collection !== 'scope', Boolean(register.tag), register.sort !== 'updated-desc'].filter(Boolean).length;
     return `
       <section class="mm-section" id="mm-register-section">
         <div class="mm-section-title"><span>Annotation register</span><span id="mm-register-count">${annotations.length} of ${metrics.scopeCount}</span></div>
         <div class="mm-register-controls">
           <input class="mm-field" id="mm-register-search" value="${escapeAttr(register.query)}" placeholder="Search title, notes, tags, owner…" aria-label="Search annotations">
-          <div class="mm-metrics">
-            <div class="mm-metric-row" id="mm-status-metrics">
-              ${registerMetric('status', 'all', 'All', metrics.status.all, register.status === 'all')}
-              ${Object.keys(STATUS_LABELS).map(status => registerMetric('status', status, STATUS_LABELS[status], metrics.status[status], register.status === status)).join('')}
-            </div>
-            <div class="mm-metric-row" id="mm-type-metrics">
-              ${registerMetric('type', 'all', 'All types', metrics.type.all, register.type === 'all')}
-              ${ANNOTATION_TYPES.map(type => registerMetric('type', type, TOOL_LABELS[type], metrics.type[type], register.type === type)).join('')}
-            </div>
+          <div class="mm-metric-row" id="mm-status-metrics">
+            ${registerMetric('status', 'all', 'All', metrics.status.all, register.status === 'all')}
+            ${Object.keys(STATUS_LABELS).map(status => registerMetric('status', status, STATUS_LABELS[status], metrics.status[status], register.status === status)).join('')}
           </div>
-          <div class="mm-filter-grid">
-            <select class="mm-select" id="mm-filter-type" aria-label="Filter by annotation type">
-              <option value="all">All types</option>
-              ${ANNOTATION_TYPES.map(type => `<option value="${type}" ${register.type === type ? 'selected' : ''}>${escapeHtml(TOOL_LABELS[type])}</option>`).join('')}
-            </select>
-            <select class="mm-select" id="mm-filter-priority" aria-label="Filter by priority">
-              <option value="all">All priorities</option>
-              ${Object.keys(PRIORITY_LABELS).map(priority => `<option value="${priority}" ${register.priority === priority ? 'selected' : ''}>${escapeHtml(PRIORITY_LABELS[priority])}</option>`).join('')}
-            </select>
-            <select class="mm-select" id="mm-filter-color" aria-label="Filter by color">
-              <option value="all">All colors</option>
-              ${COLORS.map(color => `<option value="${color}" ${register.color === color ? 'selected' : ''}>${color}</option>`).join('')}
-            </select>
-            <select class="mm-select" id="mm-filter-collection" aria-label="Filter by map set">
-              <option value="scope" ${register.collection === 'scope' ? 'selected' : ''}>Map visibility scope</option>
-              <option value="all" ${register.collection === 'all' ? 'selected' : ''}>All map sets</option>
-              ${state.collections.map(collection => `<option value="set:${escapeAttr(collection.id)}" ${register.collection === `set:${collection.id}` ? 'selected' : ''}>${escapeHtml(collection.name)}</option>`).join('')}
-            </select>
-            <input class="mm-field" id="mm-filter-tag" value="${escapeAttr(register.tag)}" placeholder="Filter tag" aria-label="Filter annotations by tag">
-            <select class="mm-select" id="mm-register-sort" aria-label="Sort annotations">
-              ${Object.entries(REGISTER_SORTS).map(([value, label]) => `<option value="${value}" ${register.sort === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}
-            </select>
-          </div>
+          <details class="mm-disclosure" ${activeFilterCount ? 'open' : ''}>
+            <summary><span class="mm-filter-summary">Filters and sorting ${activeFilterCount ? `<span class="mm-filter-count">${activeFilterCount}</span>` : ''}</span><span>Optional</span></summary>
+            <div class="mm-disclosure-body">
+              <div class="mm-metric-row" id="mm-type-metrics" style="margin-bottom:7px">
+                ${registerMetric('type', 'all', 'All types', metrics.type.all, register.type === 'all')}
+                ${ANNOTATION_TYPES.map(type => registerMetric('type', type, TOOL_LABELS[type], metrics.type[type], register.type === type)).join('')}
+              </div>
+              <div class="mm-filter-grid">
+                <select class="mm-select" id="mm-filter-type" aria-label="Filter by annotation type">
+                  <option value="all">All types</option>
+                  ${ANNOTATION_TYPES.map(type => `<option value="${type}" ${register.type === type ? 'selected' : ''}>${escapeHtml(TOOL_LABELS[type])}</option>`).join('')}
+                </select>
+                <select class="mm-select" id="mm-filter-priority" aria-label="Filter by priority">
+                  <option value="all">All priorities</option>
+                  ${Object.keys(PRIORITY_LABELS).map(priority => `<option value="${priority}" ${register.priority === priority ? 'selected' : ''}>${escapeHtml(PRIORITY_LABELS[priority])}</option>`).join('')}
+                </select>
+                <select class="mm-select" id="mm-filter-color" aria-label="Filter by color">
+                  <option value="all">All colors</option>
+                  ${COLORS.map(color => `<option value="${color}" ${register.color === color ? 'selected' : ''}>${color}</option>`).join('')}
+                </select>
+                <select class="mm-select" id="mm-filter-collection" aria-label="Filter by map layer">
+                  <option value="scope" ${register.collection === 'scope' ? 'selected' : ''}>Visible project layers</option>
+                  <option value="all" ${register.collection === 'all' ? 'selected' : ''}>All projects and layers</option>
+                  ${projectLayers(true).map(collection => `<option value="set:${escapeAttr(collection.id)}" ${register.collection === `set:${collection.id}` ? 'selected' : ''}>${collection.archived ? 'Archive · ' : ''}${escapeHtml(collection.name)}</option>`).join('')}
+                </select>
+                <input class="mm-field" id="mm-filter-tag" value="${escapeAttr(register.tag)}" placeholder="Filter tag" aria-label="Filter annotations by tag">
+                <select class="mm-select" id="mm-register-sort" aria-label="Sort annotations">
+                  ${Object.entries(REGISTER_SORTS).map(([value, label]) => `<option value="${value}" ${register.sort === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+          </details>
           <div class="mm-row">
             <button class="mm-btn" data-action="select-register-results" ${annotations.length ? '' : 'disabled'}>Select results</button>
             <button class="mm-btn" data-action="clear-selection" ${selectionCount ? '' : 'disabled'}>Clear selection</button>
@@ -1028,6 +1959,7 @@
     const coordinate = center ? `${center[1].toFixed(6)}, ${center[0].toFixed(6)}` : 'Coordinate unavailable';
     return `
       <div class="mm-inspector" data-inspector-id="${escapeAttr(annotation.id)}">
+        ${isAnnotationLocked(annotation) ? '<div class="mm-lock-banner">This annotation belongs to a locked or archived layer. Unlock or restore the layer to edit it.</div>' : ''}
         <label class="mm-label">Title
           <input class="mm-field" id="mm-title" maxlength="160" value="${escapeAttr(annotation.title)}" placeholder="Annotation title">
         </label>
@@ -1060,9 +1992,9 @@
         </label>` : ''}
         ${annotation.type === 'callout' ? `<label class="mm-label">Callout number<input class="mm-field" id="mm-callout-number" type="number" min="1" max="9999" step="1" value="${annotation.calloutNumber || 1}"></label>` : ''}
         ${['route','polygon','circle'].includes(annotation.type) ? `<label class="mm-check"><input id="mm-show-measurement" type="checkbox" ${annotation.showMeasurement !== false ? 'checked' : ''}> Show measurement label on map and evidence capture</label>` : ''}
-        <label class="mm-label">Map set
+        <label class="mm-label">Layer
           <select class="mm-select" id="mm-ann-collection">
-            ${state.collections.map(collection => `<option value="${escapeAttr(collection.id)}" ${collection.id === annotation.collectionId ? 'selected' : ''}>${escapeHtml(collection.name)}</option>`).join('')}
+            ${projectLayers(false).map(collection => `<option value="${escapeAttr(collection.id)}" ${collection.id === annotation.collectionId ? 'selected' : ''}>${collection.locked ? 'Locked · ' : ''}${escapeHtml(collection.name)}</option>`).join('')}
           </select>
         </label>
         ${geometrySummaryMarkup(annotation)}
@@ -1116,6 +2048,7 @@
       }
       if (action === 'expand') {
         ui.expanded = true;
+        if (ui.tool !== 'select') ui.workspace = 'annotate';
         renderShell();
       }
     });
@@ -1171,14 +2104,38 @@
         return;
       }
       if (!actionButton) return;
-      handleAction(actionButton.dataset.action);
+      handleAction(actionButton.dataset.action, actionButton.dataset);
     });
 
-    panel.querySelector('#mm-collection')?.addEventListener('change', event => {
-      state.activeCollectionId = event.target.value;
-      setSelection([], null, false);
+    panel.querySelector('#mm-project')?.addEventListener('change', event => {
+      switchProject(event.target.value);
+    });
+
+    panel.querySelector('#mm-show-archived-projects')?.addEventListener('change', event => {
+      state.preferences.showArchivedProjects = event.target.checked;
       saveStateSoon();
       renderAll();
+    });
+
+    panel.querySelector('#mm-import-strategy')?.addEventListener('change', event => {
+      state.preferences.importStrategy = event.target.value;
+      saveStateSoon();
+    });
+
+    panel.querySelector('#mm-auto-snapshots')?.addEventListener('change', event => {
+      state.preferences.reliability.automaticSnapshots = event.target.checked;
+      saveStateSoon('reliability-preference');
+    });
+
+    panel.querySelector('#mm-snapshot-interval')?.addEventListener('change', event => {
+      state.preferences.reliability.snapshotIntervalMinutes = clamp(Number(event.target.value) || 10, 2, 120);
+      saveStateSoon('reliability-preference');
+    });
+
+    bindProjectMetadata(panel);
+
+    panel.querySelector('#mm-collection')?.addEventListener('change', event => {
+      switchLayer(event.target.value);
     });
 
     panel.querySelector('#mm-show-all')?.addEventListener('change', event => {
@@ -1224,6 +2181,9 @@
     });
 
     const selected = findAnnotation(ui.selectedId);
+    if (selected && isAnnotationLocked(selected)) {
+      panel.querySelectorAll('[data-inspector-id] input, [data-inspector-id] textarea, [data-inspector-id] select, [data-inspector-id] button:not([data-action="zoom-selected"])').forEach(control => { control.disabled = true; });
+    }
     if (selected) {
       bindInspectorInput('#mm-title', 'title');
       bindInspectorInput('#mm-owner', 'owner');
@@ -1236,6 +2196,7 @@
       panel.querySelector('#mm-ann-status')?.addEventListener('change', event => updateSelectedWorkflowField('status', event.target.value));
       panel.querySelector('#mm-ann-priority')?.addEventListener('change', event => updateSelectedWorkflowField('priority', event.target.value));
       panel.querySelector('#mm-ann-collection')?.addEventListener('change', event => {
+        if (isAnnotationLocked(selected) || activeLayerForId(event.target.value)?.locked) { setStatus('Unlock the source and destination layers before moving annotations.', true); renderAll(); return; }
         selected.collectionId = event.target.value;
         selected.updatedAt = new Date().toISOString();
         saveStateSoon();
@@ -1253,6 +2214,27 @@
         }
       });
     }
+
+    if (ui.newProjectOpen) {
+      setTimeout(() => shadow.querySelector('#mm-new-project-name')?.focus(), 0);
+      panel.querySelector('#mm-new-project-name')?.addEventListener('keydown', event => {
+        if (event.key === 'Enter') addProject();
+        if (event.key === 'Escape') { ui.newProjectOpen = false; renderShell(); }
+      });
+    }
+  }
+
+  function bindProjectMetadata(panel) {
+    const project = currentProject();
+    if (!project) return;
+    [['#mm-project-name','name'],['#mm-project-description','description'],['#mm-project-reference','reference']].forEach(([selector, property]) => {
+      panel.querySelector(selector)?.addEventListener('input', event => {
+        if (project.status === 'archived') return;
+        project[property] = event.target.value;
+        project.updatedAt = new Date().toISOString();
+        saveStateSoon();
+      });
+    });
   }
 
   function bindEvidenceEvents(panel) {
@@ -1352,6 +2334,7 @@
   function updateSelectedWorkflowField(property, value) {
     const selected = findAnnotation(ui.selectedId);
     if (!selected || selected[property] === value) return;
+    if (isAnnotationLocked(selected)) { setStatus('Unlock this layer before editing its annotations.', true); return; }
     pushUndo();
     selected[property] = value;
     selected.updatedAt = new Date().toISOString();
@@ -1360,8 +2343,8 @@
   }
 
   function applyBulkField(property, value) {
-    const selected = selectedAnnotations();
-    if (!selected.length) return;
+    const selected = selectedAnnotations().filter(annotation => !isAnnotationLocked(annotation));
+    if (!selected.length) { setStatus('No editable annotations are selected.', true); return; }
     pushUndo();
     const now = new Date().toISOString();
     selected.forEach(annotation => {
@@ -1375,7 +2358,7 @@
   function appendBulkTag() {
     const input = shadow.querySelector('#mm-bulk-tag');
     const tag = input?.value.trim();
-    const selected = selectedAnnotations();
+    const selected = selectedAnnotations().filter(annotation => !isAnnotationLocked(annotation));
     if (!tag || !selected.length) {
       input?.focus();
       return;
@@ -1397,6 +2380,7 @@
     input?.addEventListener('input', event => {
       const selected = findAnnotation(ui.selectedId);
       if (!selected) return;
+      if (isAnnotationLocked(selected)) { setStatus('Unlock this layer before editing its annotations.', true); return; }
       selected[property] = event.target.value;
       selected.updatedAt = new Date().toISOString();
       saveStateSoon();
@@ -1408,14 +2392,58 @@
     });
   }
 
-  function handleAction(action) {
+  function handleAction(action, data = {}) {
     switch (action) {
+      case 'set-workspace':
+        ui.workspace = ['annotate', 'review', 'evidence', 'project', 'system'].includes(data.workspace) ? data.workspace : 'annotate';
+        if (ui.workspace === 'system') ui.diagnosticsOpen = true;
+        renderShell();
+        break;
+      case 'edit-selection':
+        ui.workspace = 'annotate';
+        renderShell();
+        setTimeout(() => shadow.querySelector('#mm-title')?.focus(), 0);
+        break;
       case 'collapse':
         ui.expanded = false;
         ui.clearArmed = false;
         renderShell();
         break;
+      case 'new-project':
+        ui.workspace = 'project';
+        ui.newProjectOpen = true;
+        renderShell();
+        break;
+      case 'cancel-project':
+        ui.newProjectOpen = false;
+        renderShell();
+        break;
+      case 'add-project':
+        addProject();
+        break;
+      case 'archive-project':
+        archiveCurrentProject();
+        break;
+      case 'restore-project':
+        restoreCurrentProject();
+        break;
+      case 'export-project':
+        exportProjectPackage();
+        break;
+      case 'activate-layer':
+        switchLayer(data.layerId);
+        break;
+      case 'toggle-layer-visible':
+        toggleLayerVisibility(data.layerId);
+        break;
+      case 'toggle-layer-lock':
+        toggleLayerLock(data.layerId);
+        break;
+      case 'archive-layer':
+        toggleLayerArchive(data.layerId);
+        break;
       case 'new-collection':
+        ui.workspace = 'project';
         ui.newCollectionOpen = true;
         renderShell();
         break;
@@ -1498,6 +2526,61 @@
       case 'append-bulk-tag':
         appendBulkTag();
         break;
+      case 'toggle-diagnostics':
+        ui.diagnosticsOpen = !ui.diagnosticsOpen;
+        ui.restoreSnapshotArmed = null;
+        ui.rebuildStorageArmed = false;
+        renderShell();
+        break;
+      case 'verify-storage':
+        void verifyStorageIntegrity();
+        break;
+      case 'create-snapshot':
+        ui.storageBusy = true;
+        renderShell();
+        void createRecoverySnapshot('manual').then(() => {
+          ui.storageBusy = false;
+          renderShell();
+          setStatus('Recovery snapshot created.', false);
+        }).catch(error => {
+          ui.storageBusy = false;
+          storageRuntime.lastError = error.message;
+          renderShell();
+          setStatus(`Snapshot failed: ${error.message}`, true);
+        });
+        break;
+      case 'export-diagnostics':
+        exportDiagnostics();
+        break;
+      case 'restore-snapshot':
+        if (ui.restoreSnapshotArmed === data.snapshotId) {
+          ui.storageBusy = true;
+          renderShell();
+          void restoreRecoverySnapshot(data.snapshotId).finally(() => { ui.storageBusy = false; renderShell(); });
+        } else {
+          ui.restoreSnapshotArmed = data.snapshotId;
+          renderShell();
+          setTimeout(() => {
+            if (ui.restoreSnapshotArmed === data.snapshotId) { ui.restoreSnapshotArmed = null; renderShell(); }
+          }, 5000);
+        }
+        break;
+      case 'rebuild-storage':
+        if (ui.rebuildStorageArmed) {
+          ui.storageBusy = true;
+          renderShell();
+          void rebuildIndexedDb().catch(error => {
+            storageRuntime.lastError = error.message;
+            setStatus(`Storage rebuild failed: ${error.message}`, true);
+          }).finally(() => { ui.storageBusy = false; renderShell(); });
+        } else {
+          ui.rebuildStorageArmed = true;
+          renderShell();
+          setTimeout(() => {
+            if (ui.rebuildStorageArmed) { ui.rebuildStorageArmed = false; renderShell(); }
+          }, 5000);
+        }
+        break;
       case 'expand':
         ui.expanded = true;
         renderShell();
@@ -1505,6 +2588,122 @@
       default:
         break;
     }
+  }
+
+  function currentProject() {
+    return state.projects.find(project => project.id === state.activeProjectId) || null;
+  }
+
+  function availableProjects() {
+    const projects = state.preferences.showArchivedProjects ? state.projects : state.projects.filter(project => project.status !== 'archived');
+    return projects.length ? projects : state.projects;
+  }
+
+  function projectLayers(includeArchived = false, projectId = state.activeProjectId) {
+    return state.collections
+      .filter(layer => layer.projectId === projectId && (includeArchived || !layer.archived))
+      .sort((a, b) => Number(a.order || 0) - Number(b.order || 0) || a.name.localeCompare(b.name));
+  }
+
+  function activeLayer() { return activeLayerForId(state.activeCollectionId); }
+  function activeLayerForId(id) { return state.collections.find(layer => layer.id === id) || null; }
+  function layerForAnnotation(annotation) { return annotation ? activeLayerForId(annotation.collectionId) : null; }
+  function annotationsForProject(projectId) {
+    const ids = new Set(state.collections.filter(layer => layer.projectId === projectId).map(layer => layer.id));
+    return state.annotations.filter(annotation => ids.has(annotation.collectionId));
+  }
+  function isProjectEditable(project = currentProject()) { return Boolean(project && project.status !== 'archived'); }
+  function isLayerEditable(layer = activeLayer()) { return Boolean(layer && !layer.archived && !layer.locked && isProjectEditable(state.projects.find(project => project.id === layer.projectId))); }
+  function isAnnotationLocked(annotation) { return !isLayerEditable(layerForAnnotation(annotation)); }
+
+  function switchProject(projectId) {
+    const project = state.projects.find(item => item.id === projectId);
+    if (!project) return;
+    state.activeProjectId = project.id;
+    state.preferences.register.collection = 'scope';
+    const layers = projectLayers(false, project.id);
+    state.activeCollectionId = layers[0]?.id || projectLayers(true, project.id)[0]?.id || state.activeCollectionId;
+    setSelection([], null, false);
+    saveStateSoon();
+    renderAll();
+  }
+
+  function switchLayer(layerId) {
+    const layer = activeLayerForId(layerId);
+    if (!layer || layer.projectId !== state.activeProjectId) return;
+    state.activeCollectionId = layer.id;
+    setSelection([], null, false);
+    saveStateSoon();
+    renderAll();
+  }
+
+  function addProject() {
+    const input = shadow.querySelector('#mm-new-project-name');
+    const name = input?.value.trim();
+    const templateKey = shadow.querySelector('#mm-project-template')?.value || 'blank';
+    if (!name) { input?.focus(); return; }
+    const template = PROJECT_TEMPLATES[templateKey] || PROJECT_TEMPLATES.blank;
+    pushUndo();
+    const now = new Date().toISOString();
+    const project = normalizeProject({ id: makeId('project'), name, description: template.description, status: 'active', createdAt: now, updatedAt: now });
+    state.projects.push(project);
+    const layers = template.layers.map((layerName, index) => normalizeLayer({ id: makeId('layer'), name: layerName, order: index }, project.id, index));
+    state.collections.push(...layers);
+    state.activeProjectId = project.id;
+    state.activeCollectionId = layers[0].id;
+    ui.newProjectOpen = false;
+    setSelection([], null, false);
+    saveStateSoon();
+    renderAll();
+  }
+
+  function archiveCurrentProject() {
+    const project = currentProject();
+    if (!project || project.status === 'archived') return;
+    if (!ui.projectArchiveArmed) {
+      ui.projectArchiveArmed = true;
+      renderShell();
+      setTimeout(() => { if (ui.projectArchiveArmed) { ui.projectArchiveArmed = false; renderShell(); } }, 5000);
+      return;
+    }
+    pushUndo();
+    project.status = 'archived';
+    project.updatedAt = new Date().toISOString();
+    ui.projectArchiveArmed = false;
+    const next = state.projects.find(item => item.status !== 'archived' && item.id !== project.id);
+    if (next) switchProject(next.id);
+    else { state.preferences.showArchivedProjects = true; saveStateSoon(); renderAll(); }
+  }
+
+  function restoreCurrentProject() {
+    const project = currentProject();
+    if (!project || project.status !== 'archived') return;
+    pushUndo();
+    project.status = 'active';
+    project.updatedAt = new Date().toISOString();
+    saveStateSoon();
+    renderAll();
+  }
+
+  function toggleLayerVisibility(layerId) {
+    const layer = activeLayerForId(layerId); if (!layer) return;
+    layer.visible = !layer.visible; layer.updatedAt = new Date().toISOString();
+    saveStateSoon(); renderAll();
+  }
+
+  function toggleLayerLock(layerId) {
+    const layer = activeLayerForId(layerId); if (!layer || layer.archived) return;
+    pushUndo(); layer.locked = !layer.locked; layer.updatedAt = new Date().toISOString();
+    saveStateSoon(); renderAll();
+  }
+
+  function toggleLayerArchive(layerId) {
+    const layer = activeLayerForId(layerId); if (!layer) return;
+    const liveLayers = projectLayers(false, layer.projectId);
+    if (!layer.archived && liveLayers.length <= 1) { setStatus('A project must keep at least one active layer.', true); return; }
+    pushUndo(); layer.archived = !layer.archived; layer.visible = !layer.archived; layer.locked = layer.archived ? true : false; layer.updatedAt = new Date().toISOString();
+    if (layer.id === state.activeCollectionId && layer.archived) state.activeCollectionId = projectLayers(false, layer.projectId).find(item => item.id !== layer.id)?.id || state.activeCollectionId;
+    setSelection([], null, false); saveStateSoon(); renderAll();
   }
 
   function addCollection() {
@@ -1516,9 +2715,15 @@
     }
     pushUndo();
     const collection = {
-      id: makeId('set'),
+      id: makeId('layer'),
+      projectId: state.activeProjectId,
       name,
+      visible: true,
+      locked: false,
+      archived: false,
+      order: projectLayers(true).length,
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
     state.collections.push(collection);
     state.activeCollectionId = collection.id;
@@ -1529,6 +2734,7 @@
   }
 
   function clearActiveCollection() {
+    if (!isLayerEditable()) { setStatus('Unlock and restore the active layer before clearing it.', true); return; }
     if (!ui.clearArmed) {
       ui.clearArmed = true;
       renderShell();
@@ -1540,6 +2746,7 @@
       }, 5000);
       return;
     }
+    snapshotBeforeDestructiveChange('before-clear-layer');
     pushUndo();
     state.annotations = state.annotations.filter(annotation => annotation.collectionId !== state.activeCollectionId);
     setSelection([], null, false);
@@ -1549,8 +2756,9 @@
   }
 
   function deleteSelected() {
-    const ids = selectionSet();
-    if (!ids.size) return;
+    const ids = new Set(selectedAnnotations().filter(annotation => !isAnnotationLocked(annotation)).map(annotation => annotation.id));
+    if (!ids.size) { setStatus('No editable annotations are selected.', true); return; }
+    if (ids.size >= 5) snapshotBeforeDestructiveChange('before-bulk-delete');
     pushUndo();
     state.annotations = state.annotations.filter(annotation => !ids.has(annotation.id));
     setSelection([], null, false);
@@ -1562,6 +2770,7 @@
     const vertex = ui.activeVertex;
     const annotation = vertex ? findAnnotation(vertex.annotationId) : null;
     if (!annotation || !Number.isInteger(vertex.index)) return false;
+    if (isAnnotationLocked(annotation)) { setStatus('Unlock this layer before reshaping its annotations.', true); return false; }
     if (annotation.type === 'pen' || annotation.type === 'route') {
       const coordinates = annotation.geometry?.coordinates;
       if (!Array.isArray(coordinates) || coordinates.length <= 2) return false;
@@ -1590,6 +2799,7 @@
       setStatus('Enter a valid latitude and longitude.', true);
       return;
     }
+    if (isAnnotationLocked(annotation)) { setStatus('Unlock this layer before moving annotations.', true); return; }
     const center = annotationCenter(annotation);
     if (!center) return;
     pushUndo();
@@ -1601,7 +2811,7 @@
   }
 
   function duplicateSelected() {
-    const selected = selectedAnnotations();
+    const selected = selectedAnnotations().filter(annotation => !isAnnotationLocked(annotation));
     if (!selected.length || !ui.mapView || !ui.mapRect) return;
     pushUndo();
     const copies = selected.map(annotation => {
@@ -1621,7 +2831,10 @@
   }
 
   function setTool(tool) {
+    if (ui.expanded) ui.workspace = 'annotate';
     if (!TOOL_LABELS[tool]) return;
+    if (tool !== 'select' && !ui.mapEnvironment?.supported) { ui.tool = 'select'; setStatus(ui.mapEnvironment?.reason || 'Return to a standard north-up 2D map before adding markup.', true); renderShell(); updateOverlayInteraction(); return; }
+    if (tool !== 'select' && !isLayerEditable()) { ui.tool = 'select'; setStatus('Choose an unlocked, active layer before adding markup.', true); renderShell(); updateOverlayInteraction(); return; }
     ui.tool = tool;
     ui.drawing = null;
     ui.draftPoint = null;
@@ -1631,9 +2844,9 @@
   }
 
   function annotationsInMapScope() {
-    return state.showAllCollections
-      ? state.annotations
-      : state.annotations.filter(annotation => annotation.collectionId === state.activeCollectionId);
+    const visibleLayers = projectLayers(false).filter(layer => layer.visible);
+    const layerIds = new Set(state.showAllCollections ? visibleLayers.map(layer => layer.id) : (activeLayer()?.visible && !activeLayer()?.archived ? [state.activeCollectionId] : []));
+    return state.annotations.filter(annotation => layerIds.has(annotation.collectionId));
   }
 
   function annotationsForCurrentCollection() {
@@ -1705,8 +2918,10 @@
   }
 
   function mapStatus() {
-    if (!ui.mapRect) return { warn: true, message: 'Google Maps canvas not found yet. Move or zoom the map, then reopen the panel.' };
-    if (!ui.mapView) return { warn: true, message: 'This view does not expose a standard latitude, longitude, and zoom in the URL. Return to a normal 2D map view.' };
+    if (ui.mapEnvironment && !ui.mapEnvironment.supported && ui.mapEnvironment.mode !== 'unknown') return { warn: true, message: ui.mapEnvironment.reason };
+    if (!ui.mapRect) return { warn: true, message: 'Google Maps canvas not found yet. Move or zoom the map, then open Diagnostics to inspect canvas detection.' };
+    if (!ui.mapView) return { warn: true, message: 'This view does not expose a standard latitude, longitude, and zoom. Return to a north-up 2D map view.' };
+    if (ui.tool !== 'select' && !isLayerEditable()) return { warn: true, message: 'The active project or layer is archived or locked. Select an editable layer before adding markup.' };
     return {
       warn: false,
       message: `${TOOL_LABELS[ui.tool]} active. ${ui.tool === 'select' ? 'Click to select, Shift-click to add, then drag to move or use the edit handles.' : toolInstruction(ui.tool)}`,
@@ -1737,10 +2952,17 @@
   }
 
   function updateMapContext() {
+    ui.mapEnvironment = detectMapEnvironment(location.href);
     ui.mapRect = detectMapRect();
     ui.mapView = parseMapView(location.href);
-    if (!ui.mapRect) {
+    const safe = Boolean(ui.mapRect && ui.mapView && ui.mapEnvironment.supported);
+    if (!safe) {
       overlay.style.display = 'none';
+      if (ui.tool !== 'select' && !ui.mapEnvironment.supported) {
+        ui.tool = 'select';
+        ui.drawing = null;
+        ui.interaction = null;
+      }
       return;
     }
     overlay.style.display = ui.hidden ? 'none' : 'block';
@@ -1752,14 +2974,67 @@
     updateOverlayInteraction();
   }
 
+  function detectMapEnvironment(url) {
+    let decoded = String(url || '');
+    try { decoded = decodeURIComponent(decoded); } catch (_) { /* keep original */ }
+    const cameraSegment = decoded.match(/@[^/?#]+/)?.[0] || '';
+    const signals = [];
+    const streetDom = Boolean(document.querySelector('[aria-label*="Exit Street View" i], [aria-label*="Street View" i][role="dialog"]'));
+    const streetUrl = /,3a(?:,|$)/i.test(cameraSegment) || /\/streetview(?:\/|$)/i.test(decoded);
+    if (streetDom) signals.push('street-view-dom');
+    if (streetUrl) signals.push('street-view-url');
+    if (streetDom || streetUrl) return { mode: 'street-view', supported: false, reason: 'Street View uses a perspective camera, so geographic annotations are hidden to prevent misalignment. Exit Street View to continue.', signals };
+    const altitude = /,(?!3a(?:,|$))\d+(?:\.\d+)?a(?:,|$)/i.test(cameraSegment);
+    const heading = /,\d+(?:\.\d+)?h(?:,|$)/i.test(cameraSegment);
+    const tilt = /,\d+(?:\.\d+)?t(?:,|$)/i.test(cameraSegment);
+    if (altitude) signals.push('camera-altitude');
+    if (heading) signals.push('camera-heading');
+    if (tilt) signals.push('camera-tilt');
+    if (altitude || heading || tilt) {
+      const mode = altitude ? '3d-or-tilted' : 'rotated-or-tilted';
+      return { mode, supported: false, reason: 'This map uses a rotated, tilted, or 3D camera. Return to a north-up 2D view before displaying or editing annotations.', signals };
+    }
+    const view = parseMapView(decoded);
+    if (!view) return { mode: 'unknown', supported: false, reason: 'MAPMARK cannot verify a standard 2D geographic view from this Google Maps URL.', signals: ['no-lat-lng-zoom'] };
+    return { mode: '2d-north-up', supported: true, reason: 'Standard north-up 2D map detected.', signals: ['lat-lng-zoom'] };
+  }
+
   function detectMapRect() {
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
-    const candidates = [...document.querySelectorAll('canvas')]
-      .map(canvas => ({ canvas, rect: canvas.getBoundingClientRect() }))
-      .filter(({ rect }) => rect.width > 300 && rect.height > 250 && rect.bottom > 0 && rect.right > 0)
-      .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-
+    const viewportArea = Math.max(1, viewportWidth * viewportHeight);
+    const nodes = [
+      ...document.querySelectorAll('canvas'),
+      ...document.querySelectorAll('[role="application"]'),
+      ...document.querySelectorAll('[aria-label*="Map" i][tabindex]'),
+    ];
+    const seen = new Set();
+    const candidates = [];
+    nodes.forEach((element, index) => {
+      if (!element || seen.has(element)) return;
+      seen.add(element);
+      const rect = element.getBoundingClientRect();
+      const visibleWidth = Math.max(0, Math.min(viewportWidth, rect.right) - Math.max(0, rect.left));
+      const visibleHeight = Math.max(0, Math.min(viewportHeight, rect.bottom) - Math.max(0, rect.top));
+      if (visibleWidth < 260 || visibleHeight < 220) return;
+      const style = getComputedStyle(element);
+      if (style.display === 'none' || style.visibility === 'hidden') return;
+      const areaRatio = (visibleWidth * visibleHeight) / viewportArea;
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const containsCenter = centerX > viewportWidth * 0.25 && centerX < viewportWidth * 0.85 && centerY > viewportHeight * 0.2 && centerY < viewportHeight * 0.85;
+      const canvasBonus = element.tagName === 'CANVAS' ? 25 : 0;
+      const webglBonus = element.tagName === 'CANVAS' && (Number(element.width) > 0 || Number(element.height) > 0) ? 8 : 0;
+      const score = areaRatio * 100 + canvasBonus + webglBonus + (containsCenter ? 12 : 0) - Math.max(0, rect.top) * 0.005;
+      candidates.push({ element, rect, score, source: `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ''}[${index}]` });
+    });
+    candidates.sort((a, b) => b.score - a.score);
+    ui.mapDetection = {
+      candidates: candidates.length,
+      source: candidates[0]?.source || 'none',
+      score: candidates[0]?.score || 0,
+      topCandidates: candidates.slice(0, 4).map(item => ({ source: item.source, score: round1(item.score), width: round1(item.rect.width), height: round1(item.rect.height) })),
+    };
     if (!candidates.length) return null;
     const source = candidates[0].rect;
     let left = Math.max(0, source.left);
@@ -1770,9 +3045,7 @@
     const leftPanels = [...document.querySelectorAll('[role="main"]')]
       .map(element => element.getBoundingClientRect())
       .filter(rect => rect.width >= 260 && rect.width < viewportWidth * 0.62 && rect.height > viewportHeight * 0.45 && rect.left <= 8 && rect.right < viewportWidth - 200);
-    if (leftPanels.length) {
-      left = Math.max(left, ...leftPanels.map(rect => rect.right));
-    }
+    if (leftPanels.length) left = Math.max(left, ...leftPanels.map(rect => rect.right));
 
     const width = Math.max(0, right - left);
     const height = Math.max(0, bottom - top);
@@ -1798,7 +3071,7 @@
   }
 
   function renderOverlay() {
-    if (!ui.mapRect || !ui.mapView || ui.hidden) {
+    if (!ui.mapRect || !ui.mapView || !ui.mapEnvironment?.supported || ui.hidden) {
       overlay.replaceChildren();
       return;
     }
@@ -2152,7 +3425,6 @@
       const id = target.dataset.annId;
       event.preventDefault();
       event.stopPropagation();
-      try { overlay.setPointerCapture?.(event.pointerId); } catch (_) { /* inactive pointer */ }
 
       if ((event.shiftKey || event.ctrlKey || event.metaKey) && !event.target.closest('[data-handle]')) {
         toggleSelection(id);
@@ -2162,6 +3434,14 @@
         return;
       }
 
+      if (isAnnotationLocked(findAnnotation(id))) {
+        setSelection([id], id, false);
+        ui.expanded = true;
+        setStatus('This layer is locked or archived. Unlock or restore it before editing.', true);
+        renderAll();
+        return;
+      }
+      try { overlay.setPointerCapture?.(event.pointerId); } catch (_) { /* inactive pointer */ }
       if (!isSelected(id)) setSelection([id], id, false);
       else ui.selectedId = id;
 
@@ -2199,6 +3479,7 @@
       return;
     }
 
+    if (!isLayerEditable()) { setStatus('Choose an unlocked, active layer before adding markup.', true); setTool('select'); return; }
     event.preventDefault();
     event.stopPropagation();
     try { overlay.setPointerCapture?.(event.pointerId); } catch (_) { /* synthetic or inactive pointer */ }
@@ -2437,6 +3718,7 @@
   }
 
   function addPointAnnotation(type, local) {
+    if (!isLayerEditable()) { setStatus('Choose an unlocked, active layer before adding markup.', true); return; }
     const coordinate = localToGeo(local);
     if (!coordinate) return;
     pushUndo();
@@ -2453,6 +3735,7 @@
   }
 
   function addGeometryAnnotation(type, geometry) {
+    if (!isLayerEditable()) { setStatus('Choose an unlocked, active layer before adding markup.', true); return; }
     if (!geometry.coordinates || !geometry.coordinates.length) return;
     pushUndo();
     const annotation = createAnnotation(type, geometry);
@@ -2684,7 +3967,7 @@
   }
 
   function nudgeSelection(dx, dy) {
-    const selected = selectedAnnotations();
+    const selected = selectedAnnotations().filter(annotation => !isAnnotationLocked(annotation));
     if (!selected.length || !ui.mapView || !ui.mapRect) return;
     pushUndo();
     selected.forEach(annotation => {
@@ -2808,7 +4091,7 @@
         result = filteredRegisterAnnotations();
         break;
       case 'all':
-        result = state.annotations;
+        result = annotationsForProject(state.activeProjectId);
         break;
       case 'visible':
       default:
@@ -2819,14 +4102,15 @@
   }
 
   function defaultEvidenceTitle() {
-    const active = state.collections.find(collection => collection.id === state.activeCollectionId);
-    return `${active?.name || 'Map'} Evidence`;
+    const project = currentProject();
+    const active = activeLayer();
+    return `${project?.name || active?.name || 'Map'} Evidence`;
   }
 
   function buildEvidenceContext(annotations = evidenceAnnotations()) {
     const evidence = state.preferences.evidence;
     const capturedAt = new Date();
-    const collectionNames = [...new Set(annotations.map(annotation => state.collections.find(collection => collection.id === annotation.collectionId)?.name || 'Unknown map set'))];
+    const collectionNames = [...new Set(annotations.map(annotation => state.collections.find(collection => collection.id === annotation.collectionId)?.name || 'Unknown layer'))];
     const statusCounts = Object.fromEntries(Object.keys(STATUS_LABELS).map(status => [status, annotations.filter(annotation => annotation.status === status).length]));
     const typeCounts = Object.fromEntries(ANNOTATION_TYPES.map(type => [type, annotations.filter(annotation => annotation.type === type).length]));
     return {
@@ -2836,6 +4120,7 @@
       scopeLabel: EVIDENCE_SCOPES[evidence.scope] || EVIDENCE_SCOPES.visible,
       annotations,
       collectionNames,
+      project: currentProject() ? structuredCloneSafe(currentProject()) : null,
       statusCounts,
       typeCounts,
       capturedAt,
@@ -3186,7 +4471,7 @@ ${context.subtitle ? `<p class="subtitle">${escapeHtml(context.subtitle)}</p>` :
 <section class="meta">
 <div><strong>Captured</strong>${escapeHtml(formatDateTime(context.capturedAtIso))}</div>
 <div><strong>Annotation scope</strong>${escapeHtml(context.scopeLabel)} (${context.annotations.length})</div>
-<div><strong>Map sets</strong>${escapeHtml(context.collectionNames.join(', '))}</div>
+<div><strong>Layers</strong>${escapeHtml(context.collectionNames.join(', '))}</div>
 <div><strong>Map center</strong>${escapeHtml(mapView)}</div>
 <div style="grid-column:1/-1"><strong>Source URL</strong>${escapeHtml(context.sourceUrl)}</div>
 </section>
@@ -3222,7 +4507,7 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
       '## Capture metadata',
       '',
       `- **Scope:** ${context.scopeLabel}`,
-      `- **Map sets:** ${context.collectionNames.join(', ') || 'None'}`,
+      `- **Layers:** ${context.collectionNames.join(', ') || 'None'}`,
       `- **Map center:** ${mapView}`,
       `- **Source:** ${context.sourceUrl}`,
       `- **Annotations:** ${context.annotations.length}`,
@@ -3237,11 +4522,11 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
     context.annotations.forEach((annotation, index) => {
       const center = annotationCenter(annotation);
       const coordinate = center ? `${center[1].toFixed(6)}, ${center[0].toFixed(6)}` : 'n/a';
-      const collection = state.collections.find(item => item.id === annotation.collectionId)?.name || 'Unknown map set';
+      const collection = state.collections.find(item => item.id === annotation.collectionId)?.name || 'Unknown layer';
       lines.push(`### ${index + 1}. ${annotation.title || defaultTitle(annotation.type)}`);
       lines.push('');
       lines.push(`- **Type:** ${TOOL_LABELS[annotation.type] || annotation.type}`);
-      lines.push(`- **Map set:** ${collection}`);
+      lines.push(`- **Layer:** ${collection}`);
       lines.push(`- **Status:** ${STATUS_LABELS[annotation.status]}`);
       lines.push(`- **Priority:** ${PRIORITY_LABELS[annotation.priority]}`);
       lines.push(`- **Owner:** ${annotation.owner || 'Unassigned'}`);
@@ -3266,7 +4551,7 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
     const headers = ['id','mapSet','type','title','status','priority','owner','latitude','longitude','measurements','legendLabel','markerIcon','calloutNumber','tags','notes','color','strokeWidth','createdAt','updatedAt','sourceUrl'];
     const rows = context.annotations.map(annotation => {
       const center = annotationCenter(annotation);
-      const collection = state.collections.find(item => item.id === annotation.collectionId)?.name || 'Unknown map set';
+      const collection = state.collections.find(item => item.id === annotation.collectionId)?.name || 'Unknown layer';
       return [annotation.id, collection, annotation.type, annotation.title, annotation.status, annotation.priority, annotation.owner, center?.[1] ?? '', center?.[0] ?? '', measurementLabel(annotation), annotation.legendLabel, annotation.markerIcon, annotation.calloutNumber ?? '', annotation.tags, annotation.note, annotation.color, annotation.strokeWidth, annotation.createdAt, annotation.updatedAt, context.sourceUrl];
     });
     return '\uFEFF' + [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n');
@@ -3304,22 +4589,49 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
 
   function exportNativeJson() {
     const payload = buildNativePackage();
-    downloadJson(payload, `mapmark-${dateStamp()}.json`);
+    downloadJson(payload, `mapmark-workspace-${dateStamp()}.json`);
+  }
+
+  function exportProjectPackage() {
+    const project = currentProject();
+    if (!project) return;
+    const payload = buildProjectPackage(project.id);
+    downloadJson(payload, `${slugId(project.name) || 'mapmark-project'}-${dateStamp()}.mapmark.json`);
   }
 
   function buildNativePackage() {
     return {
-      format: 'mapmark-package',
-      schema: 4,
+      format: 'mapmark-workspace',
+      schema: 6,
       application: APP.name,
       applicationVersion: APP.version,
       exportedAt: new Date().toISOString(),
       sourceUrl: location.href,
+      activeProjectId: state.activeProjectId,
       activeCollectionId: state.activeCollectionId,
       showAllCollections: state.showAllCollections,
       preferences: structuredCloneSafe(state.preferences),
+      projects: structuredCloneSafe(state.projects),
       collections: structuredCloneSafe(state.collections),
       annotations: structuredCloneSafe(state.annotations),
+    };
+  }
+
+  function buildProjectPackage(projectId = state.activeProjectId) {
+    const project = state.projects.find(item => item.id === projectId);
+    if (!project) throw new Error('Project not found.');
+    const layers = state.collections.filter(layer => layer.projectId === project.id);
+    const layerIds = new Set(layers.map(layer => layer.id));
+    return {
+      format: 'mapmark-project',
+      schema: 6,
+      application: APP.name,
+      applicationVersion: APP.version,
+      exportedAt: new Date().toISOString(),
+      sourceUrl: location.href,
+      project: structuredCloneSafe(project),
+      layers: structuredCloneSafe(layers),
+      annotations: structuredCloneSafe(state.annotations.filter(annotation => layerIds.has(annotation.collectionId))),
     };
   }
 
@@ -3330,9 +4642,10 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
   function buildGeoJson() {
     return {
       type: 'FeatureCollection',
-      name: 'MAPMARK annotations',
-      bbox: calculateBbox(state.annotations.map(annotation => annotation.geometry)),
-      features: state.annotations.map(annotation => {
+      name: `${currentProject()?.name || 'MAPMARK'} annotations`,
+      mapmarkProject: currentProject() ? structuredCloneSafe(currentProject()) : null,
+      bbox: calculateBbox(annotationsForProject(state.activeProjectId).map(annotation => annotation.geometry)),
+      features: annotationsForProject(state.activeProjectId).map(annotation => {
         const collection = state.collections.find(item => item.id === annotation.collectionId);
         return {
           type: 'Feature',
@@ -3355,6 +4668,10 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
             strokeWidth: annotation.strokeWidth,
             collectionId: annotation.collectionId,
             collectionName: collection?.name || '',
+            projectId: collection?.projectId || state.activeProjectId,
+            projectName: state.projects.find(project => project.id === collection?.projectId)?.name || '',
+            layerVisible: collection?.visible !== false,
+            layerLocked: Boolean(collection?.locked),
             createdAt: annotation.createdAt,
             updatedAt: annotation.updatedAt,
           },
@@ -3368,7 +4685,8 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
     const annotations = annotationsForCurrentCollection();
     const lines = [
       `${APP.name} MAP ANNOTATION PACKAGE`,
-      `Map set: ${active?.name || 'Unknown'}`,
+      `Project: ${currentProject()?.name || 'Unknown'}`,
+      `Layer scope: ${active?.name || 'Unknown'}`,
       `Source: ${location.href}`,
       `Exported: ${new Date().toISOString()}`,
       `Annotations: ${annotations.length}`,
@@ -3403,12 +4721,14 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
       const text = await file.text();
       const isKml = file.name.toLowerCase().endsWith('.kml') || /<\s*kml[\s>]/i.test(text);
       const imported = isKml ? parseKml(text) : parseImport(JSON.parse(text));
-      if (!imported.annotations.length) throw new Error('No supported annotations were found.');
+      if (!imported.annotations.length && !imported.projects?.length) throw new Error('No supported MAPMARK project data or annotations were found.');
+      await createRecoverySnapshot('before-import');
       pushUndo();
-      mergeImportedData(imported);
+      const report = mergeImportedData(imported, state.preferences.importStrategy);
+      ui.lastImportReport = report;
       saveStateSoon();
       renderAll();
-      setStatus(`Imported ${imported.annotations.length} annotation${imported.annotations.length === 1 ? '' : 's'}.`, false);
+      setStatus(formatImportReport(report), report.conflicts > 0);
     } catch (error) {
       console.error(`[${APP.name}] Import failed.`, error);
       setStatus(`Import failed: ${error.message}`, true);
@@ -3416,47 +4736,52 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
   });
 
   function parseImport(data) {
-    if (data?.format === 'mapmark-package' && Array.isArray(data.annotations)) {
+    if (data?.format === 'mapmark-project' && data.project && Array.isArray(data.annotations)) {
+      const project = normalizeProject(data.project);
+      const layers = (Array.isArray(data.layers) ? data.layers : []).map((layer, index) => normalizeLayer(layer, project.id, index));
       return {
-        collections: Array.isArray(data.collections) ? data.collections : [],
+        projects: [project],
+        collections: layers,
         annotations: data.annotations.filter(isValidAnnotation).map(normalizeAnnotation),
+        sourceFormat: 'project',
+      };
+    }
+    if ((data?.format === 'mapmark-workspace' || data?.format === 'mapmark-package') && Array.isArray(data.annotations)) {
+      const normalized = normalizeState(data);
+      return {
+        projects: normalized.projects,
+        collections: normalized.collections,
+        annotations: normalized.annotations,
+        sourceFormat: 'workspace',
       };
     }
     if (data?.type === 'FeatureCollection' && Array.isArray(data.features)) {
+      const projectId = String(data.mapmarkProject?.id || makeId('project'));
+      const project = normalizeProject(data.mapmarkProject || { id: projectId, name: data.name || 'Imported GeoJSON' });
       const collectionNames = new Map();
       const annotations = [];
       for (const feature of data.features) {
         if (!feature?.geometry) continue;
         const properties = feature.properties || {};
         const collectionName = String(properties.collectionName || 'Imported GeoJSON');
-        let collectionId = String(properties.collectionId || slugId(collectionName));
-        collectionNames.set(collectionId, collectionName);
+        const collectionId = String(properties.collectionId || slugId(collectionName) || makeId('layer'));
+        collectionNames.set(collectionId, { name: collectionName, visible: properties.layerVisible !== false, locked: Boolean(properties.layerLocked) });
         const type = inferAnnotationType(feature.geometry, properties.mapmarkType);
         if (!type) continue;
         annotations.push(normalizeAnnotation({
-          id: feature.id || makeId(type),
-          type,
-          collectionId,
-          title: properties.title || defaultTitle(type),
-          note: properties.note || '',
-          tags: properties.tags || '',
-          status: properties.status || 'open',
-          priority: properties.priority || 'normal',
-          owner: properties.owner || '',
-          legendLabel: properties.legendLabel || '',
-          markerIcon: properties.markerIcon || 'pin',
-          calloutNumber: properties.calloutNumber,
-          showMeasurement: properties.showMeasurement !== false,
-          color: properties.color || COLORS[0],
-          strokeWidth: properties.strokeWidth || 3,
-          geometry: feature.geometry,
-          createdAt: properties.createdAt,
-          updatedAt: properties.updatedAt,
+          id: feature.id || makeId(type), type, collectionId,
+          title: properties.title || defaultTitle(type), note: properties.note || '', tags: properties.tags || '',
+          status: properties.status || 'open', priority: properties.priority || 'normal', owner: properties.owner || '',
+          legendLabel: properties.legendLabel || '', markerIcon: properties.markerIcon || 'pin', calloutNumber: properties.calloutNumber,
+          showMeasurement: properties.showMeasurement !== false, color: properties.color || COLORS[0], strokeWidth: properties.strokeWidth || 3,
+          geometry: feature.geometry, createdAt: properties.createdAt, updatedAt: properties.updatedAt,
         }));
       }
       return {
-        collections: [...collectionNames].map(([id, name]) => ({ id, name, createdAt: new Date().toISOString() })),
+        projects: [project],
+        collections: [...collectionNames].map(([id, info], index) => normalizeLayer({ id, name: info.name, visible: info.visible, locked: info.locked }, project.id, index)),
         annotations,
+        sourceFormat: 'geojson',
       };
     }
     throw new Error('Unsupported JSON format.');
@@ -3476,11 +4801,12 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
   }
 
   function buildKml() {
-    const placemarks = state.annotations.map(annotation => {
+    const placemarks = annotationsForProject(state.activeProjectId).map(annotation => {
       const collection = state.collections.find(item => item.id === annotation.collectionId)?.name || '';
       const data = {
         mapmarkType: annotation.type,
         collection,
+        project: currentProject()?.name || '',
         status: annotation.status,
         priority: annotation.priority,
         owner: annotation.owner,
@@ -3494,7 +4820,7 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
       return `<Placemark><name>${escapeXml(annotation.title)}</name><description>${escapeXml(annotation.note)}</description><ExtendedData>${extended}</ExtendedData>${geometryToKml(annotation.geometry)}</Placemark>`;
     }).join('');
     return `<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>MAPMARK annotations</name>${placemarks}</Document></kml>`;
+<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${escapeXml(currentProject()?.name || 'MAPMARK annotations')}</name>${placemarks}</Document></kml>`;
   }
 
   function geometryToKml(geometry) {
@@ -3534,7 +4860,8 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
         color: properties.color || COLORS[0], strokeWidth: 3, geometry,
       }));
     }
-    return { collections: [{ id: collectionId, name: collectionName, createdAt: new Date().toISOString() }], annotations };
+    const projectId = makeId('project');
+    return { projects: [normalizeProject({ id: projectId, name: collectionName })], collections: [normalizeLayer({ id: collectionId, name: collectionName }, projectId, 0)], annotations, sourceFormat: 'kml' };
   }
 
   function elementsByLocalName(root, name) { return [...root.getElementsByTagName('*')].filter(element => element.localName === name); }
@@ -3544,27 +4871,96 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
   }
   function escapeXml(value) { return String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;'); }
 
-  function mergeImportedData(imported) {
-    const collectionMap = new Map();
-    for (const importedCollection of imported.collections) {
-      let id = String(importedCollection.id || makeId('set'));
-      const existing = state.collections.find(collection => collection.id === id);
-      if (existing && existing.name !== importedCollection.name) id = makeId('set');
-      if (!state.collections.some(collection => collection.id === id)) {
-        state.collections.push({
-          id,
-          name: String(importedCollection.name || 'Imported map set'),
-          createdAt: importedCollection.createdAt || new Date().toISOString(),
-        });
+  function mergeImportedData(imported, strategy = 'merge') {
+    const report = { projects: 0, layers: 0, annotations: 0, skipped: 0, conflicts: 0, strategy };
+    const projectMap = new Map();
+    const layerMap = new Map();
+    const importedProjects = imported.projects?.length ? imported.projects : [normalizeProject({ id: makeId('project'), name: 'Imported project' })];
+
+    for (const sourceProject of importedProjects) {
+      const incoming = normalizeProject(sourceProject);
+      let target = strategy === 'merge' ? state.projects.find(project => project.id === incoming.id) : null;
+      if (!target && strategy === 'merge') target = state.projects.find(project => project.name.trim().toLowerCase() === incoming.name.trim().toLowerCase());
+      if (!target) {
+        target = structuredCloneSafe(incoming);
+        if (strategy === 'duplicate' || state.projects.some(project => project.id === target.id)) target.id = makeId('project');
+        if (strategy === 'duplicate') target.name = uniqueProjectName(`${target.name} copy`);
+        state.projects.push(target);
+        report.projects += 1;
+      } else if (String(incoming.updatedAt) > String(target.updatedAt)) {
+        target.description = incoming.description || target.description;
+        target.reference = incoming.reference || target.reference;
+        target.updatedAt = incoming.updatedAt;
       }
-      collectionMap.set(String(importedCollection.id), id);
+      projectMap.set(incoming.id, target.id);
     }
-    for (const annotation of imported.annotations) {
-      const copy = normalizeAnnotation(annotation);
-      copy.id = state.annotations.some(item => item.id === copy.id) ? makeId(copy.type) : copy.id;
-      copy.collectionId = collectionMap.get(copy.collectionId) || state.activeCollectionId;
+
+    for (const sourceLayer of imported.collections || []) {
+      const sourceProjectId = sourceLayer.projectId || importedProjects[0].id;
+      const targetProjectId = projectMap.get(sourceProjectId) || [...projectMap.values()][0] || state.activeProjectId;
+      const incoming = normalizeLayer(sourceLayer, targetProjectId, projectLayers(true, targetProjectId).length);
+      let target = strategy === 'merge' ? state.collections.find(layer => layer.projectId === targetProjectId && (layer.id === incoming.id || layer.name.trim().toLowerCase() === incoming.name.trim().toLowerCase())) : null;
+      if (!target) {
+        target = structuredCloneSafe(incoming);
+        target.projectId = targetProjectId;
+        if (strategy === 'duplicate' || state.collections.some(layer => layer.id === target.id)) target.id = makeId('layer');
+        state.collections.push(target);
+        report.layers += 1;
+      }
+      layerMap.set(String(sourceLayer.id), target.id);
+    }
+
+    if (!(imported.collections || []).length) {
+      const projectId = [...projectMap.values()][0] || state.activeProjectId;
+      const layer = normalizeLayer({ id: makeId('layer'), name: 'Imported annotations' }, projectId, projectLayers(true, projectId).length);
+      state.collections.push(layer); report.layers += 1; layerMap.set('__fallback__', layer.id);
+    }
+
+    for (const sourceAnnotation of imported.annotations || []) {
+      const copy = normalizeAnnotation(sourceAnnotation);
+      copy.collectionId = layerMap.get(copy.collectionId) || layerMap.get('__fallback__') || state.activeCollectionId;
+      const existing = state.annotations.find(annotation => annotation.id === copy.id);
+      if (!existing || strategy === 'duplicate') {
+        if (existing || strategy === 'duplicate') copy.id = makeId(copy.type);
+        state.annotations.push(copy); report.annotations += 1; continue;
+      }
+      if (annotationFingerprint(existing) === annotationFingerprint(copy)) { report.skipped += 1; continue; }
+      copy.id = makeId(copy.type);
+      copy.title = `${copy.title || defaultTitle(copy.type)} (import conflict)`;
+      copy.tags = [...parseTags(copy.tags), 'import-conflict'].filter((value, index, all) => all.indexOf(value) === index).join(', ');
       state.annotations.push(copy);
+      report.annotations += 1;
+      report.conflicts += 1;
     }
+
+    const firstProjectId = [...projectMap.values()][0];
+    if (firstProjectId) {
+      state.activeProjectId = firstProjectId;
+      state.activeCollectionId = projectLayers(false, firstProjectId)[0]?.id || projectLayers(true, firstProjectId)[0]?.id || state.activeCollectionId;
+    }
+    setSelection([], null, false);
+    return report;
+  }
+
+  function annotationFingerprint(annotation) {
+    return JSON.stringify({
+      type: annotation.type, collectionId: annotation.collectionId, title: annotation.title, note: annotation.note, tags: annotation.tags,
+      status: annotation.status, priority: annotation.priority, owner: annotation.owner, legendLabel: annotation.legendLabel,
+      markerIcon: annotation.markerIcon, calloutNumber: annotation.calloutNumber, showMeasurement: annotation.showMeasurement,
+      color: annotation.color, strokeWidth: annotation.strokeWidth, geometry: annotation.geometry,
+    });
+  }
+
+  function uniqueProjectName(base) {
+    const names = new Set(state.projects.map(project => project.name.toLowerCase()));
+    if (!names.has(base.toLowerCase())) return base;
+    let index = 2;
+    while (names.has(`${base} ${index}`.toLowerCase())) index += 1;
+    return `${base} ${index}`;
+  }
+
+  function formatImportReport(report) {
+    return `Import ${report.strategy === 'duplicate' ? 'copy' : 'merge'}: ${report.projects} project${report.projects === 1 ? '' : 's'}, ${report.layers} layer${report.layers === 1 ? '' : 's'}, ${report.annotations} annotation${report.annotations === 1 ? '' : 's'} added, ${report.skipped} duplicate${report.skipped === 1 ? '' : 's'} skipped${report.conflicts ? `, ${report.conflicts} conflict${report.conflicts === 1 ? '' : 's'} preserved as copies` : ''}.`;
   }
 
   function calculateBbox(geometries) {
@@ -3771,6 +5167,13 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
       renderShell();
       return;
     }
+    if (ui.expanded && event.altKey && !event.shiftKey && ['1','2','3','4','5'].includes(event.key)) {
+      event.preventDefault();
+      ui.workspace = ['annotate','review','evidence','project','system'][Number(event.key) - 1];
+      if (ui.workspace === 'system') ui.diagnosticsOpen = true;
+      renderShell();
+      return;
+    }
     if (event.key === 'Enter' && ui.drawing && ['route','polygon'].includes(ui.drawing.type)) {
       event.preventDefault();
       completeMultiPointDrawing();
@@ -3860,5 +5263,6 @@ ${context.options.includeTable ? `<h2>Annotation Register</h2><table class="tabl
   }
 
   renderAll();
+  void initializeReliabilityStorage();
   console.info(`[${APP.name}] v${APP.version} loaded. Alt+Shift+M toggles the panel.`);
 })();
