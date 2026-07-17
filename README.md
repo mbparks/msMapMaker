@@ -1,29 +1,71 @@
 # MAPMARK: Google Maps Annotator
 
-**Version 1.4.0**
+**Version 1.7.0**
 
-MAPMARK is a Tampermonkey userscript that adds a private, editable geographic annotation layer to the Google Maps website. Markup is stored as longitude and latitude rather than fixed screen pixels, allowing annotations to stay aligned as the map pans or zooms.
+MAPMARK is a Tampermonkey userscript that adds private, editable project layers to the Google Maps website. Markup is stored as longitude and latitude rather than fixed screen pixels, allowing annotations to stay aligned as the map pans or zooms.
 
-MAPMARK combines map drawing, a searchable review register, workflow metadata, GIS exchange, and evidence-report generation without requiring a Google Maps API key or an external MAPMARK service.
+MAPMARK combines map drawing, project packages, independently visible and lockable layers, a searchable review register, workflow metadata, GIS exchange, and evidence-report generation without requiring a Google Maps API key or an external MAPMARK service.
 
-## What is new in v1.4
+## What is new in v1.7
 
-Version 1.4 adds rich geographic markup and measurement workflows.
+Version 1.7 is the workflow and interface cleanup release. The expanded panel no longer presents every MAPMARK capability in one long vertical stack. It is organized around five stages of work:
 
-- Editable multi-point routes and polylines.
-- Editable freeform polygons.
-- Geodesic radius circles and buffer areas.
-- Automatic route-distance measurement.
-- Automatic polygon perimeter and area measurement.
-- Automatic circle radius, diameter, and area measurement.
-- Numbered map callouts with automatic sequencing.
-- Custom map markers with seven selectable symbols.
-- Optional measurement labels on the map and in evidence captures.
-- Per-annotation legend labels and color-coded evidence legends.
-- Exact latitude and longitude repositioning from the Inspector.
-- KML import and export alongside native JSON and GeoJSON.
-- Schema 4 native packages with rich geographic metadata.
-- Automatic migration of v1.0 through v1.3 data.
+1. **Annotate** — Choose tools, set appearance, and edit the current selection.
+2. **Review** — Search the annotation register, assign workflow fields, and resolve open items.
+3. **Evidence** — Choose an evidence scope and create images, reports, Markdown, or CSV.
+4. **Project** — Manage project metadata, layers, imports, exports, and backups.
+5. **System** — Verify storage, manage recovery snapshots, and inspect map compatibility.
+
+The active project and active layer remain visible in a compact context bar regardless of the current stage. Undo, redo, markup visibility, and selection clearing remain available in a persistent command bar.
+
+Additional v1.7 refinements include:
+
+- Five purpose-built workspaces instead of one continuously scrolling panel.
+- A compact, always-visible project and layer selector.
+- Five primary annotation tools shown first, with six advanced line and shape tools grouped under a disclosure.
+- Context-sensitive marker options rather than permanently visible marker controls.
+- Review filters and sorting grouped under an optional disclosure.
+- A dedicated selection-details card in the Annotate workspace.
+- A compact selected-item summary in Review with direct map focus and Edit Details actions.
+- Project and layer creation buttons that take the user directly to the Project workspace.
+- Reliability controls moved out of the normal annotation path into the System workspace.
+- A fixed-height panel with one independently scrolling workspace, eliminating the feeling of scrolling through the entire application.
+- Workflow keyboard shortcuts: **Alt+1** through **Alt+5**.
+
+All v1.6 storage, recovery, annotation, measurement, register, package, evidence, GeoJSON, and KML capabilities remain available. The workspace data schema remains schema 6, so v1.7 does not require another data migration.
+
+## Reliability and recovery
+
+### IndexedDB migration
+
+On first v1.6 launch, MAPMARK reads the existing `mapmark.state.v1` Tampermonkey value, normalizes it to schema 6, writes it into IndexedDB, and creates an initial recovery snapshot. Existing annotations, projects, layers, filters, styles, and evidence settings are retained.
+
+The Tampermonkey value remains as an emergency mirror so the workspace can still be opened and saved when IndexedDB is unavailable because of browser policy, privacy restrictions, or a damaged database.
+
+### Integrity checks and quarantine
+
+Workspace records and snapshots contain an FNV-1a checksum. MAPMARK verifies both the checksum and the internal data structure before accepting a record. Checks include project, layer, and annotation identifiers; cross-references; and Point, LineString, and Polygon geometry.
+
+A failed primary record is copied into a quarantine store with its failure reason. MAPMARK then searches recovery snapshots newest-first and restores the first verified record. Invalid snapshots are also quarantined rather than retried indefinitely.
+
+### Recovery snapshots
+
+Automatic recovery snapshots are enabled by default at a ten-minute interval. The Reliability panel allows intervals from two minutes to two hours. MAPMARK also takes protective snapshots before higher-risk operations.
+
+The newest twelve snapshots are retained. Each entry records its date, reason, annotation count, application version, and checksum. Restoring a snapshot requires a second confirmation click and creates a protective snapshot of the current workspace first.
+
+### Diagnostics and rebuild
+
+The Reliability panel can:
+
+- Verify the active IndexedDB record.
+- Create a manual recovery snapshot.
+- Restore a recent verified snapshot.
+- Export a diagnostics JSON file that contains counts and health information but not annotation titles, notes, tags, owners, or geometry.
+- Rebuild the IndexedDB database while retaining the current in-memory workspace.
+
+The exported diagnostics report includes browser and viewport information, storage status, map-view detection, candidate-canvas scores, workspace counts, and integrity results.
+
 
 ## Annotation tools
 
@@ -37,7 +79,7 @@ Click once to place a conventional MAPMARK note marker with a title and detailed
 
 ### Callout
 
-Click once to place a numbered callout. Numbers increment automatically within the active map set and can be edited in the Inspector.
+Click once to place a numbered callout. Numbers increment automatically within the active layer and can be edited in the Inspector.
 
 ### Marker
 
@@ -87,19 +129,68 @@ Press and drag to create a freehand geographic sketch. The path is simplified to
 4. Save and enable the script.
 5. Open Google Maps in a standard north-up, two-dimensional map view.
 
-Installing v1.4 over an earlier MAPMARK release retains the existing `mapmark.state.v1` local store. Older data receives safe defaults for any fields introduced after its original version.
+Installing v1.7 over an earlier MAPMARK release automatically migrates the existing `mapmark.state.v1` Tampermonkey workspace into IndexedDB and creates a verified recovery snapshot. Existing projects, layers, annotations, map sets, and preferences are preserved.
 
 ## Basic workflow
 
 1. Navigate Google Maps to the site or area being reviewed.
-2. Use the compact MAPMARK dock on the right edge of the map.
-3. Click **M** to open the full panel, or choose a tool directly from the dock.
-4. Choose or create a map set.
-5. Place geographic markup.
-6. Use the Inspector to add title, status, priority, owner, notes, tags, and legend information.
-7. Use the Annotation Register to search, filter, sort, and reopen annotations.
-8. Use Evidence Capture to create a PNG, printable report, Markdown package, or CSV register.
-9. Export native JSON for a complete MAPMARK backup, GeoJSON for GIS workflows, or KML for common mapping tools.
+2. Use the compact MAPMARK dock for quick placement, or click **M** to open the expanded workspace.
+3. Confirm the active project and layer in the context bar.
+4. Open **Annotate** to place and edit map markup.
+5. Open **Review** to search the register, set status and priority, assign owners, and resolve findings.
+6. Open **Evidence** to choose a scope and create a PNG, printable report, Markdown package, or CSV register.
+7. Open **Project** to manage metadata and layers or exchange `.mapmark.json`, workspace JSON, GeoJSON, and KML files.
+8. Open **System** only when checking storage health, restoring a recovery point, or diagnosing map alignment.
+
+The compact command bar remains visible across all five workspaces for undo, redo, markup visibility, and selection management.
+
+## Projects and layers
+
+### Projects
+
+A project is the top-level portable work package. Each project stores:
+
+- Project name
+- Description and scope
+- Project, case, work-order, or review reference
+- Active or archived status
+- Created and updated timestamps
+- Its complete set of map layers and annotations
+
+Archiving a project removes it from the normal project selector without deleting its contents. Enable **Show archived projects in selector** to reopen and restore archived work.
+
+### Project templates
+
+MAPMARK includes four starting structures:
+
+- **Blank project:** One general Field Notes layer.
+- **Site survey:** Observations, Photo Points, Measurements, and Follow-up.
+- **Accessibility review:** Accessible Routes, Entrances, Barriers, Amenities, and Actions.
+- **Infrastructure inspection:** Assets, Defects, Utilities, Safety, and Repairs.
+
+Templates create an organizational starting point only. Layers can be added, hidden, locked, or archived afterward.
+
+### Layers
+
+Every annotation belongs to one layer inside one project. A layer can be:
+
+- **Visible:** Its annotations may appear on the map.
+- **Hidden:** Its annotations remain stored but are omitted from the overlay.
+- **Locked:** Its annotations can be selected and reviewed but cannot be moved, reshaped, restyled, edited, duplicated, or deleted.
+- **Archived:** The layer and its annotations remain in the project package but the layer is removed from normal active work.
+
+Enable **Show every visible layer in this project** to review multiple layers together. With that option disabled, MAPMARK shows only the active layer.
+
+A project must retain at least one active layer. MAPMARK prevents archiving the final active layer.
+
+### Import behavior
+
+MAPMARK provides two package-import strategies:
+
+- **Merge into workspace:** Match projects and layers by identifier or name, skip exact duplicate annotations, and preserve same-ID differences as new annotations tagged `import-conflict`.
+- **Import as a separate copy:** Create a separately named project and remap all project, layer, and annotation identifiers.
+
+Import never silently overwrites a divergent local annotation.
 
 ## Rich geometry and measurement
 
@@ -205,7 +296,7 @@ Filters are available for:
 - Priority
 - Color
 - Tag
-- Map set
+- Layer
 
 Sorting modes include:
 
@@ -239,10 +330,10 @@ Bulk controls can update status, priority, and tags across a multi-selection.
 Evidence outputs use one of five scopes:
 
 - Visible map scope
-- Active map set
+- Active layer
 - Selected annotations
 - Current register results
-- All annotations
+- Active project archive
 
 ### Annotated PNG
 
@@ -282,7 +373,7 @@ Markdown exports include capture metadata and a complete section for each scoped
 
 CSV exports include:
 
-- Annotation ID and map set
+- Annotation ID, project, and layer
 - Type and title
 - Status, priority, and owner
 - Latitude and longitude
@@ -298,25 +389,26 @@ The file is UTF-8 with a byte-order mark for reliable spreadsheet import.
 
 ## Data exchange
 
-### Native MAPMARK JSON
+### Native MAPMARK packages
 
-Native JSON is the preferred backup and editing format. Schema 4 preserves:
+MAPMARK v1.6 uses schema 6 and provides two native package forms.
 
-- Map sets
-- Every annotation type
-- Geographic geometry
-- Styling
-- Workflow metadata
-- Marker symbols and callout numbers
-- Legend labels
+**Project package (`.mapmark.json`)** is the preferred sharing and editing format for one project. It preserves:
+
+- Project metadata and archive state
+- Every layer, including visibility, lock, order, and archive state
+- Every annotation type and geographic geometry
+- Styling and workflow metadata
+- Marker symbols, callout numbers, and legend labels
 - Measurement visibility
-- Register preferences
-- Evidence preferences
 - Created and updated timestamps
+
+**Workspace JSON** backs up every project, layer, annotation, and user preference in the browser profile.
+
 
 ### GeoJSON
 
-GeoJSON exports a standard `FeatureCollection`:
+GeoJSON exports the active project as a standard `FeatureCollection`:
 
 - Points for notes, labels, callouts, and markers
 - LineStrings for arrows, routes, and freehand drawings
@@ -326,7 +418,7 @@ MAPMARK-specific fields are retained in each feature's properties, including cal
 
 ### KML
 
-KML export creates placemarks containing names, descriptions, geometry, and MAPMARK metadata in `ExtendedData`.
+KML export creates placemarks for the active project containing names, descriptions, geometry, project/layer context, and MAPMARK metadata in `ExtendedData`.
 
 KML import supports placemarks containing:
 
@@ -356,21 +448,23 @@ Keyboard commands do not run while typing in an input, textarea, or select contr
 
 ## Storage and privacy
 
-MAPMARK stores data through Tampermonkey's local userscript storage.
+MAPMARK stores its authoritative workspace in IndexedDB under the current Google Maps browser origin and maintains an emergency mirror through Tampermonkey storage.
 
 - Annotations are not written into Google Maps.
 - Data is not uploaded to a Google account by MAPMARK.
 - MAPMARK does not require an external server.
-- Search, filters, styles, and evidence settings remain local.
+- Recovery snapshots and quarantined records remain local to the browser profile.
+- Search, filters, styles, evidence settings, and reliability preferences remain local.
 - Tab-capture frames are processed locally in the browser.
+- Diagnostics exports omit annotation contents and geometry.
 
-Export native JSON before clearing browser data, resetting Tampermonkey, or moving to another browser profile.
+Export workspace JSON before clearing site data, resetting Tampermonkey, or moving to another browser profile. Export `.mapmark.json` project packages when sharing or archiving individual projects. IndexedDB and the emergency mirror are both browser-profile storage and are not substitutes for an external backup.
 
 ## Known limitations
 
 - Alignment is designed for standard north-up, two-dimensional Google Maps views.
-- Street View, rotated maps, tilted satellite imagery, and three-dimensional views are not supported in v1.4.0.
-- MAPMARK reads map center and zoom from the Google Maps URL. Pan or zoom once if the panel cannot establish a geographic fix.
+- Street View, rotated maps, tilted satellite imagery, and three-dimensional views are intentionally blocked. MAPMARK hides its overlay and returns to Select mode until a standard north-up 2D view is restored.
+- MAPMARK reads map center and zoom from the Google Maps URL. Views without a verifiable latitude, longitude, and zoom are treated as unsafe rather than projected approximately.
 - Measurements are approximate and depend on the map view, geographic projection, and annotation precision.
 - Circle geometry is represented by a 64-segment polygon rather than a native GeoJSON circle because GeoJSON does not define a circle geometry type.
 - KML folders, inner polygon holes, MultiGeometry, altitude modes, and advanced styles are not fully interpreted.
@@ -381,13 +475,60 @@ Export native JSON before clearing browser data, resetting Tampermonkey, or movi
 
 ## Technical design
 
-MAPMARK uses Web Mercator projection mathematics to convert between screen coordinates and geographic coordinates. It detects the principal Google Maps canvas and draws an isolated SVG overlay inside Shadow DOM.
+MAPMARK uses Web Mercator projection mathematics to convert between screen coordinates and geographic coordinates. It scores visible canvas and map-container candidates, subtracts obstructing side panels, verifies a north-up 2D camera, and draws an isolated SVG overlay inside Shadow DOM.
 
-Route, polygon, and circle measurements use geographic calculations rather than measuring screen pixels. Geometry is stored in GeoJSON-compatible structures so it can be transferred through JSON, GeoJSON, and KML.
+Route, polygon, and circle measurements use geographic calculations rather than measuring screen pixels. Geometry is stored in GeoJSON-compatible structures so it can be transferred through project packages, workspace JSON, GeoJSON, and KML. Projects and layers are organizational metadata around that portable geographic geometry.
 
-Precision edits occur interactively in screen space and are converted back into longitude and latitude. Exact-coordinate movement translates the complete geometry geographically.
+Precision edits occur interactively in screen space and are converted back into longitude and latitude. Exact-coordinate movement translates the complete geometry geographically. IndexedDB records are serialized with integrity checksums, and verified snapshots provide bounded local recovery history.
 
 ## Release notes
+
+### v1.7.0
+
+- Replaced the single long expanded panel with five workflow workspaces: Annotate, Review, Evidence, Project, and System.
+- Added a persistent project and layer context bar.
+- Added a persistent command bar for undo, redo, markup visibility, and selection management.
+- Prioritized five common annotation tools and grouped six advanced drawing tools.
+- Made marker controls context-sensitive.
+- Collapsed advanced register filters and sorting behind an optional disclosure.
+- Added a dedicated selection-details area to Annotate and a compact selection summary to Review.
+- Moved project metadata, layers, package exchange, and backups into one Project workflow.
+- Moved diagnostics and recovery controls into a dedicated System workflow.
+- Added Alt+1 through Alt+5 workspace shortcuts.
+- Preserved schema 6 and all v1.6 data without migration.
+
+### v1.6.0
+
+- Migrated the authoritative workspace store to IndexedDB.
+- Added automatic migration from v1.0 through v1.5 Tampermonkey data.
+- Retained Tampermonkey storage as an emergency mirror and fallback.
+- Added schema and geometry integrity validation.
+- Added checksums for workspace records and snapshots.
+- Added quarantine storage for damaged records.
+- Added automatic recovery from the newest verified snapshot.
+- Added configurable automatic snapshots and protective snapshots before higher-risk operations.
+- Capped recovery history at twelve snapshots.
+- Added storage verification, manual snapshots, confirmed snapshot restoration, diagnostics export, and non-destructive IndexedDB rebuild.
+- Added scored map-canvas detection and side-panel subtraction.
+- Added explicit Street View, rotated, tilted, 3D, and unverifiable-view detection.
+- Suppressed overlays and drawing tools in unsafe map modes.
+- Advanced native workspace and project packages to schema 6.
+
+
+### v1.5.0
+
+- Added named project packages with description, reference, timestamps, and archive status.
+- Converted map sets into project-owned layers.
+- Added independent layer visibility, locking, and archiving.
+- Added blank, site-survey, accessibility-review, and infrastructure-inspection templates.
+- Added portable `.mapmark.json` project export.
+- Added complete workspace JSON export.
+- Added merge and duplicate import strategies.
+- Added exact-duplicate skipping and non-destructive same-ID conflict preservation.
+- Scoped GeoJSON and KML exports to the active project.
+- Advanced native storage and packages to schema 5.
+- Added automatic migration from v1.0 through v1.4.
+
 
 ### v1.4.0
 
