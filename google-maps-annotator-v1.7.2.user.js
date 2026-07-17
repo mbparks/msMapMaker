@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MAPMARK — Google Maps Annotator
 // @namespace    https://mbparks.com/fieldinstruments
-// @version      1.7.1
-// @description  A workflow-centered Google Maps annotation workspace with precision markup, review registers, evidence capture, project packages, resilient local storage, and improved contrast.
+// @version      1.7.2
+// @description  A workflow-centered Google Maps annotation workspace with precision markup, review registers, evidence capture, project packages, resilient local storage, and a high-contrast workflow interface.
 // @author       Michael Parks / Green Shoe Garage
 // @match        https://www.google.com/maps/*
 // @match        https://maps.google.com/*
@@ -18,7 +18,7 @@
 
   const APP = Object.freeze({
     name: 'MAPMARK',
-    version: '1.7.1',
+    version: '1.7.2',
     storageKey: 'mapmark.state.v1',
     dbName: 'mapmark.indexeddb.v1',
     dbVersion: 1,
@@ -851,6 +851,74 @@
       .mm-status.warn { background: rgba(249,168,37,.18); color: #ffe199; }
       input::placeholder, textarea::placeholder { color: rgba(215, 224, 229, .78); }
     }
+
+
+    /* v1.7.2 aggressive high-contrast cleanup */
+    #mm-panel, .mm-pane, .mm-card, .mm-contextbar, .mm-workflow-tabs, .mm-commandbar, .mm-disclosure, .mm-selection-bar, .mm-status, .mm-system-intro, .mm-import-report, .mm-bulk, .mm-list-item, .mm-diag-item, .mm-diag-row {
+      color: var(--mm-text);
+    }
+    .mm-header, .mm-header * , .mm-pane-heading h2, .mm-card-title strong, .mm-list-title, .mm-diag-item strong, .mm-layer-name {
+      color: var(--mm-text) !important;
+    }
+    .mm-version, .mm-save, .mm-pane-heading p, .mm-pane-count, .mm-command-label, .mm-list-meta, .mm-check,
+    .mm-help, .mm-filter-summary, .mm-card-title, .mm-context-field label, .mm-section-title,
+    .mm-selection-bar small, .mm-system-intro, .mm-import-report, .mm-status, .mm-empty, .mm-bulk-title,
+    .mm-style-line span, .mm-diag-item span, .mm-diag-row small, .mm-disclosure > summary > span:last-child {
+      color: #d8e3e9 !important;
+    }
+    .mm-pane-heading p, .mm-help, .mm-status, .mm-system-intro, .mm-import-report, .mm-empty, .mm-list-meta { line-height: 1.5; }
+    .mm-section-title, .mm-card-title, .mm-context-field label, .mm-bulk-title { font-size: 11px !important; }
+    .mm-version, .mm-save, .mm-pane-count, .mm-command-label, .mm-list-meta, .mm-check, .mm-help, .mm-chip, .mm-metric, .mm-filter-count { font-size: 11px !important; }
+    .mm-pane-heading p, .mm-field, .mm-select, .mm-textarea, .mm-btn, .mm-command-btn, .mm-tool, .mm-status, .mm-system-intro, .mm-import-report { font-size: 12px !important; }
+    .mm-mini-btn { font-size: 13px !important; }
+    .mm-workflow-tab { font-size: 10px !important; }
+    .mm-workflow-tab .mm-tab-icon { font-size: 16px !important; }
+    .mm-field, .mm-select, .mm-textarea, .mm-btn, .mm-mini-btn, .mm-command-btn, .mm-tool, .mm-metric, .mm-list-item, .mm-card, .mm-disclosure, .mm-selection-bar, .mm-status, .mm-system-intro, .mm-import-report, .mm-bulk, .mm-diag-item, .mm-diag-row {
+      border-color: #73848f !important;
+    }
+    .mm-field, .mm-select, .mm-textarea, .mm-btn, .mm-mini-btn, .mm-command-btn, .mm-tool, .mm-metric, .mm-list-item, .mm-card, .mm-disclosure, .mm-selection-bar, .mm-status, .mm-system-intro, .mm-import-report, .mm-bulk, .mm-diag-item, .mm-diag-row, .mm-style-line {
+      background: #26323a !important;
+    }
+    .mm-contextbar { background: #1c252c !important; }
+    .mm-header, .mm-workflow-tabs, .mm-commandbar { background: #1a2229 !important; }
+    #mm-panel { background: #11181d !important; }
+    .mm-workflow-tab { color: #d7e1e7 !important; }
+    .mm-workflow-tab:hover { background: #28353d !important; color: #ffffff !important; }
+    .mm-workflow-tab.active { background: #3b2b2d !important; color: #ffd4cf !important; border-bottom-color: #ff9b90 !important; }
+    .mm-workflow-tab .mm-tab-badge, .mm-pane-count, .mm-filter-count {
+      background: #26323a !important;
+      color: #f4f8fa !important;
+      border-color: #73848f !important;
+    }
+    .mm-btn, .mm-command-btn, .mm-tool, .mm-mini-btn, .mm-metric { color: #f4f8fa !important; }
+    .mm-btn:hover, .mm-command-btn:hover, .mm-tool:hover, .mm-mini-btn:hover, .mm-mini-btn.active, .mm-metric:hover, .mm-metric.active, .mm-list-item:hover, .mm-list-item.active {
+      background: #33414a !important;
+      color: #ffffff !important;
+      border-color: #ff9b90 !important;
+    }
+    .mm-list-item.primary {
+      background: #3a2426 !important;
+      border-color: #ff9b90 !important;
+      box-shadow: inset 3px 0 0 #ff9b90 !important;
+    }
+    .mm-chip {
+      background: #1d262c !important;
+      color: #eef3f6 !important;
+      border-color: #73848f !important;
+      font-weight: 700 !important;
+    }
+    .mm-chip.status-open { background: rgba(58,134,255,.22) !important; color: #cfe4ff !important; border-color: rgba(58,134,255,.46) !important; }
+    .mm-chip.status-review { background: rgba(255,193,7,.22) !important; color: #ffe9a8 !important; border-color: rgba(255,193,7,.4) !important; }
+    .mm-chip.status-resolved { background: rgba(76,175,80,.22) !important; color: #cdeecf !important; border-color: rgba(76,175,80,.42) !important; }
+    .mm-chip.status-archived { background: #243038 !important; color: #d8e3e9 !important; }
+    .mm-chip.priority-high, .mm-chip.priority-critical { background: rgba(244,67,54,.22) !important; color: #ffd3cf !important; border-color: rgba(244,67,54,.42) !important; }
+    .mm-status.warn { background: rgba(249,168,37,.22) !important; color: #ffe199 !important; border-color: rgba(249,168,37,.5) !important; }
+    .mm-field, .mm-select, .mm-textarea { color: #f6fbfd !important; }
+    .mm-field::placeholder, .mm-textarea::placeholder { color: #c6d3da !important; opacity: 1 !important; }
+    .mm-select option { color: #101417 !important; }
+    .mm-check input { transform: scale(1.02); }
+    .mm-diag-grid { gap: 8px !important; }
+    .mm-list { gap: 7px !important; }
 
     .mm-hidden { display: none !important; }
     #mm-import { display: none; }
